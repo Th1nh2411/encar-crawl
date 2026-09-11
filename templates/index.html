@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Encar crawl dashboard</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --ink: #14161a; --muted: #6b7280;
+    --line: #e3e6ea; --accent: #2563eb; --ok: #047857; --ok-bg: #ecfdf5;
+    --sold: #b91c1c; --sold-bg: #fef2f2; --warn: #92400e; --warn-bg: #fffbeb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --panel: #171a21; --ink: #e8eaed; --muted: #9aa3af;
+      --line: #262b34; --accent: #60a5fa; --ok: #6ee7b7; --ok-bg: #06281f;
+      --sold: #fca5a5; --sold-bg: #2a1214; --warn: #fcd34d; --warn-bg: #2a2109;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 20px 16px 60px; }
+
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 18px; }
+  h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+  .spacer { flex: 1; }
+
+  .btn {
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+    padding: 8px 14px; border-radius: 8px; cursor: pointer; font: inherit; font-weight: 550;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn[disabled] { opacity: .55; cursor: not-allowed; }
+
+  nav { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
+  nav a {
+    padding: 7px 13px; border-radius: 8px; color: var(--muted); font-weight: 550;
+  }
+  nav a.on { background: var(--panel); color: var(--ink); border: 1px solid var(--line); }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card .k { color: var(--muted); font-size: 12px; }
+  .card .v { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+  .card .s { color: var(--muted); font-size: 11.5px; }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .panel-hd { padding: 11px 14px; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .panel-hd h2 { font-size: 13px; margin: 0; font-weight: 600; }
+  .hint { color: var(--muted); font-size: 12px; }
+
+  form.filters { display: flex; gap: 8px; flex-wrap: wrap; padding: 11px 14px; border-bottom: 1px solid var(--line); }
+  input[type=search], select {
+    font: inherit; padding: 6px 9px; border: 1px solid var(--line);
+    border-radius: 7px; background: var(--bg); color: var(--ink);
+  }
+
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .plate { font-weight: 600; }
+  .dim { color: var(--muted); }
+
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; }
+  .tag.active { background: var(--ok-bg); color: var(--ok); }
+  .tag.sold { background: var(--sold-bg); color: var(--sold); }
+  .tag.warn { background: var(--warn-bg); color: var(--warn); }
+  .tag.plain { background: var(--bg); color: var(--muted); }
+
+  .pager { display: flex; gap: 8px; align-items: center; padding: 11px 14px; }
+  pre.log {
+    margin: 0; padding: 12px 14px; background: var(--bg); color: var(--muted);
+    font: 11.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+    max-height: 320px; overflow: auto; white-space: pre;
+  }
+  .empty { padding: 30px 14px; text-align: center; color: var(--muted); }
+
+  #runbox { margin-bottom: 16px; display: none; }
+  #runbox.on { display: block; }
+  #runout {
+    margin: 0; padding: 12px 14px; background: var(--bg);
+    font: 11.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+    max-height: 220px; overflow: auto; white-space: pre-wrap;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block; animation: pulse 1.1s infinite; }
+  @keyframes pulse { 50% { opacity: .25; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Encar crawl dashboard</h1>
+    <span class="hint" id="laststate">
+      {% if stats.last_run %}Last run: {{ stats.last_run.started_at|dt }} · {{ stats.last_run.status }}{% endif %}
+    </span>
+    <span class="spacer"></span>
+    <select id="crawlmodel">
+      <option value="">All models</option>
+      {% for m in models %}<option value="{{ m.key }}">{{ m.label }}</option>{% endfor %}
+    </select>
+    <button class="btn primary" id="crawlbtn">Crawl now</button>
+  </header>
+
+  {% if stats.error %}
+    <div class="panel" style="margin-bottom:16px">
+      <div class="panel-hd"><h2>Cannot read the database</h2></div>
+      <pre class="log">{{ stats.error }}
+
+Run: python migrate.py</pre>
+    </div>
+  {% else %}
+  <div class="cards">
+    <div class="card"><div class="k">Cars for sale</div><div class="v">{{ stats.cars_active }}</div><div class="s">by plate</div></div>
+    <div class="card"><div class="k">Cars sold</div><div class="v">{{ stats.cars_sold }}</div><div class="s">every ad gone</div></div>
+    <div class="card"><div class="k">Cars total</div><div class="v">{{ stats.cars_total }}</div><div class="s">unique plates</div></div>
+    <div class="card"><div class="k">Listings</div><div class="v">{{ stats.listings_total }}</div><div class="s">one car, often several</div></div>
+  </div>
+  {% endif %}
+
+  <div class="panel" id="runbox">
+    <div class="panel-hd"><span class="dot"></span><h2 id="runtitle">Crawling…</h2></div>
+    <pre id="runout"></pre>
+  </div>
+
+  <nav>
+    <a href="/" class="{{ 'on' if view == 'cars' }}">Cars (by plate)</a>
+    <a href="/listings" class="{{ 'on' if view == 'listings' }}">Listings</a>
+    <a href="/runs" class="{{ 'on' if view == 'runs' }}">Run history</a>
+  </nav>
+
+  <div class="panel">
+    {% if view == 'cars' %}
+      <div class="panel-hd">
+        <h2>Cars — grouped by plate</h2>
+        <span class="hint">A car counts as sold only once every one of its ads is gone.</span>
+      </div>
+    {% elif view == 'listings' %}
+      <div class="panel-hd">
+        <h2>Encar listings</h2>
+        <span class="hint">One row per ad (car_id). The same car can appear several times, priced differently.</span>
+      </div>
+    {% else %}
+      <div class="panel-hd">
+        <h2>Run history</h2>
+        <span class="hint">One batch per model per crawl, with its timing and outcome.</span>
+      </div>
+    {% endif %}
+
+    {% if view != 'runs' %}
+    <form class="filters" method="get">
+      <input type="search" name="q" value="{{ filters.q }}"
+             placeholder="{{ 'Plate or model…' if view == 'cars' else 'Plate, car_id or model…' }}">
+      <select name="model">
+        <option value="">All models</option>
+        {% for m in models %}
+        <option value="{{ m.key }}" {{ 'selected' if filters.model == m.key }}>{{ m.label }}</option>
+        {% endfor %}
+      </select>
+      <select name="status">
+        <option value="">Any status</option>
+        <option value="ACTIVE" {{ 'selected' if filters.status == 'ACTIVE' }}>For sale</option>
+        <option value="SOLD" {{ 'selected' if filters.status == 'SOLD' }}>Sold</option>
+      </select>
+      <button class="btn">Filter</button>
+    </form>
+    {% endif %}
+
+    <div class="scroll">
+    {% if not rows %}
+      <div class="empty">No data yet — hit “Crawl now”.</div>
+    {% elif view == 'cars' %}
+      <table>
+        <thead><tr>
+          <th>Plate</th><th>Model</th><th>Year</th><th>Colour</th>
+          <th class="num">Mileage</th><th class="num">Price (만원)</th>
+          <th class="num">Ads</th><th>Status</th><th>Last seen</th>
+        </tr></thead>
+        <tbody>
+        {% for r in rows %}
+          <tr>
+            <td class="plate">{{ r.vehicle_no }}</td>
+            <td>{{ r.model_info or '—' }}</td>
+            <td class="dim">{{ r.form_year or '—' }}</td>
+            <td class="dim">{{ r.color_name or '—' }}</td>
+            <td class="num">{{ '{:,}'.format(r.mileage) if r.mileage else '—' }}</td>
+            <td class="num">
+              {% if r.min_active_price and r.max_active_price and r.min_active_price != r.max_active_price %}
+                {{ r.min_active_price }}–{{ r.max_active_price }}
+              {% else %}{{ r.min_active_price or '—' }}{% endif %}
+            </td>
+            <td class="num">
+              {{ r.active_listings }}<span class="dim">/{{ r.listing_count }}</span>
+            </td>
+            <td>
+              {% if r.status == 'SOLD' %}<span class="tag sold">Sold</span>
+              {% elif r.max_missing_streak %}<span class="tag warn">Missed &times;{{ r.max_missing_streak }}</span>
+              {% else %}<span class="tag active">For sale</span>{% endif %}
+            </td>
+            <td class="dim">{{ r.last_seen_at|dt }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% elif view == 'listings' %}
+      <table>
+        <thead><tr>
+          <th>car_id</th><th>Plate</th><th>Model</th><th>Year</th>
+          <th class="num">Mileage</th><th class="num">Price</th><th>Status</th>
+          <th>Last seen</th><th>Encar</th>
+        </tr></thead>
+        <tbody>
+        {% for r in rows %}
+          <tr>
+            <td class="dim">{{ r.car_id }}</td>
+            <td class="plate">{{ r.vehicle_no or '—' }}</td>
+            <td>{{ r.model_info or '—' }}</td>
+            <td class="dim">{{ r.form_year or '—' }}</td>
+            <td class="num">{{ '{:,}'.format(r.mileage) if r.mileage else '—' }}</td>
+            <td class="num">{{ r.price or '—' }}</td>
+            <td>
+              {% if r.status == 'SOLD' %}<span class="tag sold">Sold</span>
+              {% elif r.missing_streak %}<span class="tag warn">Missed &times;{{ r.missing_streak }}</span>
+              {% else %}<span class="tag active">For sale</span>{% endif %}
+              {% if r.is_duplicate %}<span class="tag plain">dup</span>{% endif %}
+            </td>
+            <td class="dim">{{ r.last_seen_at|dt }}</td>
+            <td><a href="http://www.encar.com/dc/dc_cardetailview.do?carid={{ r.car_id }}" target="_blank" rel="noopener">open</a></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <table>
+        <thead><tr>
+          <th>#</th><th>Model</th><th>Started</th><th>Finished</th><th class="num">Duration</th>
+          <th>Result</th><th class="num">Crawled</th><th class="num">Pages</th>
+          <th class="num">Marked sold</th><th>Note</th>
+        </tr></thead>
+        <tbody>
+        {% for r in rows %}
+          <tr>
+            <td class="dim">{{ r.id }}</td>
+            <td>{{ r.model_key }}</td>
+            <td>{{ r.started_at|dt }}</td>
+            <td class="dim">{{ r.finished_at|dt }}</td>
+            <td class="num">{{ r.duration_s|dur }}</td>
+            <td>
+              {% if r.status == 'OK' %}<span class="tag active">OK</span>
+              {% elif r.status == 'RUNNING' %}<span class="tag plain">running</span>
+              {% elif r.status == 'PARTIAL' %}<span class="tag warn">partial</span>
+              {% else %}<span class="tag sold">failed</span>{% endif %}
+            </td>
+            <td class="num">{{ r.crawled_count }}</td>
+            <td class="num">{{ '%.0f%%'|format(r.completion_rate * 100) if r.completion_rate is not none else '—' }}</td>
+            <td class="num">{{ r.sold_marked_count }}</td>
+            <td class="dim">{{ r.note or '' }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+    </div>
+
+    {% set pages = ((total - 1) // page_size) + 1 if total else 1 %}
+    {% if pages > 1 %}
+    <div class="pager">
+      {% set qs = request.args.to_dict() %}
+      {% if page > 1 %}
+        {% set _ = qs.update({'page': page - 1}) %}
+        <a class="btn" href="?{{ qs|urlencode }}">← Prev</a>
+      {% endif %}
+      <span class="hint">Page {{ page }} of {{ pages }} · {{ total }} rows</span>
+      {% if page < pages %}
+        {% set _ = qs.update({'page': page + 1}) %}
+        <a class="btn" href="?{{ qs|urlencode }}">Next →</a>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  {% if view == 'runs' %}
+  <div class="panel" style="margin-top:16px">
+    <div class="panel-hd"><h2>Recent log</h2><span class="hint">logs/encar.log</span></div>
+    <pre class="log">{{ log_tail }}</pre>
+  </div>
+  {% endif %}
+
+</div>
+
+<script>
+const btn = document.getElementById('crawlbtn');
+const box = document.getElementById('runbox');
+const out = document.getElementById('runout');
+const title = document.getElementById('runtitle');
+let polling = null;
+
+function render(state, message) {
+  if (state.running || (state.output && state.output.length)) box.classList.add('on');
+  btn.disabled = !!state.running;
+  btn.textContent = state.running ? 'Crawling…' : 'Crawl now';
+
+  if (state.running) {
+    title.textContent = 'Crawling ' + (state.models.join(', ') || 'all models') +
+                        ' — started ' + (state.startedAt || '').replace('T', ' ');
+  } else if (state.returncode !== null && state.returncode !== undefined) {
+    const codes = {0: 'Done', 1: 'A model failed', 2: 'Locked — another run is in progress'};
+    title.textContent = (codes[state.returncode] || 'Finished (exit ' + state.returncode + ')');
+    document.querySelector('#runbox .dot').style.display = 'none';
+  }
+  if (message) out.textContent = message + '\n' + (state.output || []).join('\n');
+  else if (state.output) out.textContent = state.output.join('\n');
+  out.scrollTop = out.scrollHeight;
+}
+
+async function poll() {
+  const r = await fetch('/api/crawl/status');
+  const state = await r.json();
+  render(state);
+  if (!state.running) {
+    clearInterval(polling); polling = null;
+    // Crawl finished — reload so the tables and counters show the new data.
+    setTimeout(() => location.reload(), 1200);
+  }
+}
+
+btn.addEventListener('click', async () => {
+  const model = document.getElementById('crawlmodel').value;
+  btn.disabled = true;
+  const r = await fetch('/api/crawl', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({models: model ? [model] : []}),
+  });
+  const data = await r.json();
+  document.querySelector('#runbox .dot').style.display = '';
+  render(data, data.message);
+  if (!polling) polling = setInterval(poll, 1500);
+});
+
+// A crawl started elsewhere (or before a reload) should still show up.
+poll();
+</script>
+</body>
+</html>

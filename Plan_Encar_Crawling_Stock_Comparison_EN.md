@@ -12,21 +12,44 @@ For this plan, the crawl target is much smaller (only 2 fields), so **the top pr
 
 ## 2. Scope
 
-### Data to crawl (only 2 fields)
+### API verification result (done before development — supersedes the original assumption)
+
+The original plan assumed the vehicle number could be read straight off the listing page. It cannot. Verified against the live API on 2026-09-10:
+
+| Check | Result |
+|---|---|
+| Does the listing API return the vehicle number? | **No.** Neither `/search/car/list/premium` nor `/search/car/list/general` returns `vehicleNo`. The listing payload only carries `Id`, `Manufacturer`, `Model`, `Badge`, `Year`, `Mileage`, `Price`, `ServiceCopyCar`, dealer fields, photos. |
+| Where does the vehicle number live? | Only on the per-vehicle detail endpoint `/v1/readside/vehicle/<carId>` (~0.47s/request sequential). |
+| Max listing page size | ≥ 200 rows per request — 1,181 G20 listings fit in 6 requests. |
+
+Three options followed from this:
+
+| Option | Requests per model | Note |
+|---|---|---|
+| A — listing + detail per car | ~1,187 | Restores the vehicle number, but reintroduces the detail-page cost the plan set out to remove |
+| B — one keyword search per plate in `stock` | 1 per stock vehicle | The existing `status_crawl.py` approach |
+| **C — listing only, match on Encar `carId`** | **~6** | **Chosen.** Requires `stock` to store the Encar listing id — confirmed it does |
+
+**Decision: option C.** The matching key is the Encar listing id (`car_id`), not the vehicle number.
+
+### Data to crawl (from the listing API only)
 
 | Field | Description |
 |---|---|
-| Vehicle number (차량번호) | Used as the matching key |
-| Model info (모델정보) | Model name level detail — trim/year-level detail is not required |
+| `Id` → `car_id` (차량번호 대체 키) | **Matching key** — the Encar listing id |
+| Model info (모델정보) | `Manufacturer + Model + Badge` — model name level detail |
+| `ServiceCopyCar` → `is_duplicate` | Marks dealer duplicate listings; kept so a duplicate is never mistaken for a separate car |
 
-> Price, options, photos, dealer info, etc. from detail pages are **not** collected. Limiting the scope to these two fields is what makes the crawl lightweight.
+> Price, options, photos, dealer info, etc. from detail pages are **not** collected. `vehicle_no` stays as a nullable column for an optional later enrichment pass, but nothing in the comparison depends on it.
 
 ### Process flow
 
-1. Crawl Encar's search/listing results filtered to a specific model → extract only vehicle number + model info
-2. Store the crawled results in a separate table (`crawled_vehicles`, working name)
-3. Compare `crawled_vehicles` against our `stock` table, matched by vehicle number
-4. Any vehicle number present in `stock` but absent from `crawled_vehicles` → **update status to SOLD**
+1. Crawl Encar's search API filtered to a specific model, 200 rows per request → extract `car_id` + model info
+2. Store the crawled results in a separate table (`crawled_vehicles`)
+3. Compare `crawled_vehicles` against our `stock` table, matched by `car_id`
+4. Any `car_id` present in `stock` (scoped to the crawled model) but absent from `crawled_vehicles` → **update status to SOLD**
+
+> **Scoping matters**: a batch only crawls one model, so the comparison must be restricted to the `stock` rows of that model. Each entry in `models.json` carries a `stock_filter` SQL fragment for exactly this. Without it, every other model in `stock` would look "missing" and be sold off.
 
 ### Out of scope
 
@@ -43,9 +66,11 @@ For this plan, the crawl target is much smaller (only 2 fields), so **the top pr
 | Column | Type | Description |
 |---|---|---|
 | id | PK | |
-| vehicle_no | varchar, index | Vehicle number |
-| model_info | varchar | Model info |
-| crawl_batch_id | varchar/int | Identifier for this crawl run (used in the comparison logic) |
+| crawl_batch_id | bigint, FK | Identifier for this crawl run (used in the comparison logic) |
+| car_id | varchar, index | **Encar listing id — the matching key** |
+| vehicle_no | varchar, index, nullable | Not available from the listing API; reserved for optional enrichment |
+| model_info | varchar | Manufacturer + Model + Badge |
+| is_duplicate | bool | `ServiceCopyCar = DUPLICATION` |
 | crawled_at | datetime | |
 
 > This table should be treated as a **full snapshot on every run** rather than an accumulating log. Either truncate and reload the table each cycle, or filter by the latest `crawl_batch_id` when comparing — this keeps "listing disappeared" logic simple.
@@ -67,21 +92,34 @@ For this plan, the crawl target is much smaller (only 2 fields), so **the top pr
 
 ### `stock` (existing inventory table)
 
-- Keep the existing structure; join/compare on the vehicle number column
+- Keep the existing structure; join/compare on the **Encar listing id** column
 - Assumes a status field already exists to represent "sold"
+- This repo does not own that schema, so the table and column names are read from env (`STOCK_TABLE`, `STOCK_CAR_ID_COL`, `STOCK_STATUS_COL`, `STOCK_SOLD_AT_COL`, `STOCK_SOLD_VALUE`)
 
 ---
 
 ## 4. Comparison (matching) logic
 
 ```
-for each vehicle_no in stock (status != SOLD):
-    if vehicle_no not in crawled_vehicles(latest batch):
+for each car_id in stock (status != SOLD AND matches this batch's model):
+    if car_id not in crawled_vehicles(this batch):
         stock.status = SOLD
         stock.sold_confirmed_at = now()
 ```
 
-- This can be implemented as a simple LEFT JOIN / NOT IN query
+Implemented as a single LEFT JOIN update:
+
+```sql
+UPDATE stock s
+LEFT JOIN crawled_vehicles cv
+       ON cv.car_id = s.car_id AND cv.crawl_batch_id = :batch_id
+SET s.status = 'SOLD', s.sold_confirmed_at = NOW()
+WHERE <stock_filter for this model>
+  AND s.status <> 'SOLD'
+  AND s.car_id IS NOT NULL AND s.car_id <> ''
+  AND cv.id IS NULL;
+```
+
 - **Caution**: if the crawl partially fails (blocking, network errors, incomplete pagination), valid still-listed vehicles could be incorrectly marked as "not found"
 
 ### Safeguard: crawl completion-rate threshold (decided)
@@ -112,28 +150,33 @@ Thresholds are stored as config (not hardcoded) so they can be tuned after obser
 
 ## 5. Crawl optimization (key requirement)
 
-The old approach was slow because it visited **individual detail pages** to pull large amounts of data.
-Since this plan only needs 2 fields (vehicle number, model info), optimize as follows:
+The old approach was slow because it visited **individual detail pages** to pull large amounts of data. What the implementation actually does:
 
-1. **Collect only from the listing/search results page — do not visit detail pages**
-   Vehicle number and model info are typically already visible on the search results list (card UI). Confirm (via manual check before development starts) whether both fields can be fully extracted from the listing page alone, without opening detail pages.
+1. **Listing API only — no detail pages, no browser, no Bright Data**
+   `GET https://api.encar.com/search/car/list/premium?count=true&q=<model filter>&sr=|ModifiedDate|<offset>|<limit>`, parsed as JSON. Bright Data's Scraping Browser is not needed at all for this job, which removes both its latency and its cost.
 
-2. **Prefer calling the internal API (XHR/JSON) directly over rendering full HTML**
-   Check browser dev tools for an internal API called when the search results load. If one exists, call it directly and parse JSON — much lighter and faster than HTML parsing.
+2. **200 rows per request**
+   Tested up to 200 (the UI uses far less). 1,181 G20 listings = 6 requests instead of 79 at the default page size.
 
 3. **Scope the crawl to a specific model filter**
-   Use a search URL/query already filtered to the target model, rather than crawling all listings, to minimize the number of pages to traverse.
+   One entry per model in `models.json`; the search query is built from `manufacturer` / `model_group` / `model`.
 
-4. **Block unnecessary resource loading** (if using a browser-based crawler)
-   Disable loading of images, CSS, fonts, ad scripts, etc. that aren't needed for parsing (Bright Data's Scraping Browser supports resource-blocking options).
+4. **Parallel page fetching**
+   4 workers by default (`SYNC_LIST_WORKERS`), each with its own keep-alive `Session`. Reusing a Session — not throttling — is what avoids the HTTP 407 blocking; a request that opens a fresh connection each time is what gets blocked.
 
-5. **Increase parallelism**
-   Listing pages are lighter and lower-risk to fetch than detail pages, so concurrency can be increased to reduce total crawl time — but test to find a safe concurrency level, since excessive parallelism raises blocking risk.
+5. **Short backoff, capped retries**
+   4 attempts with a 3s-linear backoff plus jitter, so a few failing pages cannot stall the batch. A page that exhausts its retries is counted as a miss and lowers `completion_rate`, which is exactly what the safeguard gate measures.
 
-6. **Minimize unnecessary retries/wait times**
-   Use short backoff instead of immediate retries on failure, and tune timeout values so a handful of failing pages don't delay the entire batch.
+### Measured result
 
-> Before development starts, it's recommended to run a **single-page sample test** to confirm that vehicle number + model info can be fully extracted from the listing page alone, and to finalize the crawling approach based on that result.
+| Model | Listings | Pages | Time |
+|---|---|---|---|
+| BMW 3시리즈 (G20) | 1,178 | 6 | 2.89s |
+| BMW X3 (G01) | 637 | 4 | 1.29s |
+| BMW X5 (G05) | 1,226 | 7 | 1.64s |
+| **Total** | **3,041** | **17** | **5.81s** |
+
+> Known trade-off: pagination sorts by `ModifiedDate`, so a listing that is bumped mid-crawl can shift between pages. Rows are deduplicated by `car_id`, and a shifted row can only ever cause a *missing* row, which the completion-rate and drop guards are there to absorb (the observed 1,178 vs. a reported count of 1,181 is this effect). If it ever matters, over-fetching with overlapping page windows is the fix.
 
 ---
 
@@ -146,8 +189,38 @@ Since this plan only needs 2 fields (vehicle number, model info), optimize as fo
 
 ## 7. Deliverables
 
-1. `crawled_vehicles` + `crawl_batches` table migrations
-2. Encar listing-page crawler (Bright Data integration, lightweight approach as described above)
-3. Batch comparison logic: `stock` vs `crawled_vehicles`
-4. Sold-status update logic with logging/alerting
-5. Crawl completion-rate tracking + threshold gate before the comparison logic (§4), with alerts on `PARTIAL` / `FAILED` batches
+| # | Deliverable | Status | Where |
+|---|---|---|---|
+| 1 | `crawled_vehicles` + `crawl_batches` migrations | Done | `status_crawl/migrations/001_crawl_tables.sql` |
+| 2 | Encar listing crawler (direct API, no browser) | Done, tested live | `status_crawl/encar_stock_sync.py` |
+| 3 | Per-model crawl config + `stock` scoping filter | Done — **`stock_filter` values are placeholders, need the real `stock` columns** | `status_crawl/models.json` |
+| 4 | Comparison logic `stock` vs `crawled_vehicles` | Done, SQL verified; not yet run against a real DB | `compare_and_mark()` |
+| 5 | Sold-status update + run logging | Done — every run writes a `crawl_batches` row with its metrics and outcome | `crawl_batches` |
+| 6 | Completion-rate tracking + threshold gate (§4) | Done, gate matrix tested | `evaluate()` |
+| 7 | Alerting on `PARTIAL` / `FAILED` batches | **Not done** — batches are recorded and logged, but nothing pages anyone yet | — |
+
+### Running it
+
+```bash
+pip install requests pymysql python-dotenv
+
+# Crawl only, no DB — smoke test
+python status_crawl/encar_stock_sync.py --no-db --json output/snapshot.json
+
+# Full run, but roll back — reports how many rows WOULD be marked SOLD
+python status_crawl/encar_stock_sync.py --dry-run
+
+# Full run
+python status_crawl/encar_stock_sync.py
+
+# One model
+python status_crawl/encar_stock_sync.py --model bmw_3series_g20
+```
+
+### Before the first real run
+
+1. Fill in `DB_HOST` / `DB_NAME` in `.env` (the file already has `DB_PORT` / `DB_USERNAME` / `DB_PASSWORD`)
+2. Point `STOCK_*` env vars at the real `stock` column names
+3. Replace the placeholder `stock_filter` in `models.json` with the real per-model condition
+4. Apply `migrations/001_crawl_tables.sql`
+5. Run with `--dry-run` first and sanity-check the SOLD count before letting it write
