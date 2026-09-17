@@ -17,7 +17,10 @@
 # a secret. Ctrl-C stops both processes and the public URL dies with them.
 
 set -euo pipefail
-cd "$(dirname "$0")"
+# app.py lives in stock_sync/ together with its templates/, and gunicorn
+# resolves "app:app" against the working directory. The app itself anchors its
+# data paths on the project root, so it does not care where it is started from.
+cd "$(dirname "$0")/stock_sync"
 
 PORT="${UI_PORT:-5050}"
 WORKERS=1

@@ -1,0 +1,19 @@
+const links = $('a[href*="carid="], a[href*="/cars/detail/"]').toArray();
+
+const ids = new Set();
+
+links.forEach((link) => {
+    const href = $(link).attr("href") || "";
+    // ?carid=42688114  or  /cars/detail/42688114
+    const match =
+        href.match(/[?&]carid=(\d+)/) || href.match(/\/cars\/detail\/(\d+)/);
+    if (match) ids.add(match[1]);
+});
+
+const car_urls = Array.from(ids).map(
+    (id) => `https://fem.encar.com/cars/detail/${id}`,
+);
+
+console.log(`Found ${car_urls.length} unique cars on this page`);
+
+return { car_urls };

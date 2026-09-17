@@ -71,7 +71,13 @@ except ImportError:  # dotenv is optional
     def load_dotenv(*_a, **_kw):  # type: ignore
         return False
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+# The scripts live in stock_sync/, but models.json, migrations/, logs/ and the
+# shared .env stay in the project root one level up -- quick_crawl/ reads the
+# same .env. HERE keeps meaning "project root", so every caller that joins it
+# with "models.json" or "migrations" is unaffected by the move; anything that
+# needs a file next to these scripts uses PKG_DIR instead.
+HERE = os.path.dirname(PKG_DIR)
 load_dotenv(os.path.join(HERE, os.pardir, ".env"))
 load_dotenv(os.path.join(HERE, ".env"))
 
@@ -243,11 +249,17 @@ def get_session() -> requests.Session:
 
 
 def build_query(spec: Dict[str, str]) -> str:
-    """Search expression for one model. requests handles the URL-encoding."""
+    """Search expression for one model. requests handles the URL-encoding.
+
+    `car_type` is Encar's domestic flag: Y for Korean makes (현대, 기아, 제네시스,
+    KG모빌리티), N for imports. A Korean model queried with N returns 0 listings,
+    so it is per model; the default keeps the original import entries unchanged.
+    Encar escapes ')' inside names as '_)' — write names that way in models.json.
+    """
     return (
-        "(And.Hidden.N._.(C.CarType.N._.(C.Manufacturer.{manufacturer}._."
+        "(And.Hidden.N._.(C.CarType.{car_type}._.(C.Manufacturer.{manufacturer}._."
         "(C.ModelGroup.{model_group}._.Model.{model}.))))"
-    ).format(**spec)
+    ).format(**{"car_type": "N", **spec})
 
 
 def fetch_page(query: str, offset: int, limit: int, want_count: bool) -> Dict[str, Any]:

@@ -82,6 +82,12 @@
     max-height: 320px; overflow: auto; white-space: pre;
   }
   .empty { padding: 30px 14px; text-align: center; color: var(--muted); }
+  .notice {
+    padding: 11px 14px; background: var(--warn-bg); color: var(--warn);
+    border-bottom: 1px solid var(--line); font-size: 12.5px; line-height: 1.55;
+  }
+  .notice a { color: inherit; text-decoration: underline; }
+  code { font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
 
   #runbox { margin-bottom: 16px; display: none; }
   #runbox.on { display: block; }
@@ -132,13 +138,36 @@ Run: python migrate.py</pre>
   </div>
 
   <nav>
+    <a href="/stock" class="{{ 'on' if view == 'stock' }}">Stock (rent_product)</a>
     <a href="/" class="{{ 'on' if view == 'cars' }}">Cars (by plate)</a>
     <a href="/listings" class="{{ 'on' if view == 'listings' }}">Listings</a>
     <a href="/runs" class="{{ 'on' if view == 'runs' }}">Run history</a>
   </nav>
 
   <div class="panel">
-    {% if view == 'cars' %}
+    {% if view == 'stock' %}
+      <div class="panel-hd">
+        <h2>Stock — sonokong <code>rent_product</code></h2>
+        <span class="hint">판매중 / 판매완료 derived by matching <code>car_number</code> against the Encar crawl.
+          Live stock only (<code>is_del = 0</code>).
+          {% if stock_counts.get('TEST') %}
+            {% if show_test %}<a href="/stock">Hide {{ stock_counts.TEST }} QA rows</a>
+            {% else %}<a href="/stock?test=1">Show {{ stock_counts.TEST }} QA rows</a>{% endif %}
+          {% endif %}
+        </span>
+      </div>
+      {% if stock_counts.get('UNKNOWN') %}
+      <div class="notice">
+        <strong>{{ stock_counts.get('UNKNOWN') }} cars are 미확인</strong> — their plate has never
+        appeared in any crawl. The live stock is Korean-market models (현대 그랜저, 쌍용 티볼리,
+        기아 카니발, 제네시스 G80), while <code>models.json</code> currently crawls BMW only —
+        so nothing can match yet. Absent from a search that never looked for them is not
+        evidence of a sale. Add these models to <code>models.json</code> and crawl to resolve
+        them, or <a href="?strict=1&amp;status=SOLD_OUT">count 미확인 as 판매완료</a> to apply
+        the rule literally.
+      </div>
+      {% endif %}
+    {% elif view == 'cars' %}
       <div class="panel-hd">
         <h2>Cars — grouped by plate</h2>
         <span class="hint">A car counts as sold only once every one of its ads is gone.</span>
@@ -159,17 +188,29 @@ Run: python migrate.py</pre>
     <form class="filters" method="get">
       <input type="search" name="q" value="{{ filters.q }}"
              placeholder="{{ 'Plate or model…' if view == 'cars' else 'Plate, car_id or model…' }}">
+      {% if view != 'stock' %}
       <select name="model">
         <option value="">All models</option>
         {% for m in models %}
         <option value="{{ m.key }}" {{ 'selected' if filters.model == m.key }}>{{ m.label }}</option>
         {% endfor %}
       </select>
+      {% endif %}
+      {% if view == 'stock' %}
+      <select name="status">
+        <option value="">Any status</option>
+        <option value="ON_SALE" {{ 'selected' if filters.status == 'ON_SALE' }}>판매중 (on sale)</option>
+        <option value="SOLD_OUT" {{ 'selected' if filters.status == 'SOLD_OUT' }}>판매완료 (sold out)</option>
+        <option value="UNKNOWN" {{ 'selected' if filters.status == 'UNKNOWN' }}>미확인 (not crawled)</option>
+      </select>
+      {% if strict %}<input type="hidden" name="strict" value="1">{% endif %}
+      {% else %}
       <select name="status">
         <option value="">Any status</option>
         <option value="ACTIVE" {{ 'selected' if filters.status == 'ACTIVE' }}>For sale</option>
         <option value="SOLD" {{ 'selected' if filters.status == 'SOLD' }}>Sold</option>
       </select>
+      {% endif %}
       <button class="btn">Filter</button>
     </form>
     {% endif %}
@@ -177,6 +218,36 @@ Run: python migrate.py</pre>
     <div class="scroll">
     {% if not rows %}
       <div class="empty">No data yet — hit “Crawl now”.</div>
+    {% elif view == 'stock' %}
+      <table>
+        <thead><tr>
+          <th>CAR_NUMBER</th><th>MODEL</th><th class="num">YEAR</th>
+          <th class="num">MILEAGE</th><th class="num">PRICE</th><th>STATUS</th>
+          <th class="num">Encar ads</th><th>Encar last seen</th>
+        </tr></thead>
+        <tbody>
+        {% for r in rows %}
+          <tr>
+            <td class="plate">{{ r.car_number }}</td>
+            <td>{{ r.model_info or '—' }}</td>
+            <td class="num dim">{{ r.model_year or '—' }}</td>
+            <td class="num">{{ '{:,}'.format(r.mileage) if r.mileage else '—' }}</td>
+            <td class="num">{{ '{:,}'.format(r.price) if r.price else '—' }}</td>
+            <td>
+              {% if r.status == 'ON_SALE' %}<span class="tag active">판매중</span>
+              {% elif r.status == 'SOLD_OUT' %}<span class="tag sold">판매완료</span>
+              {% elif strict %}<span class="tag sold">판매완료</span><span class="tag plain">미확인</span>
+              {% else %}<span class="tag plain">미확인</span>{% endif %}
+            </td>
+            <td class="num">
+              {% if r.listing_count %}{{ r.active_listings }}<span class="dim">/{{ r.listing_count }}</span>
+              {% else %}<span class="dim">—</span>{% endif %}
+            </td>
+            <td class="dim">{{ r.encar_last_seen_at|dt }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
     {% elif view == 'cars' %}
       <table>
         <thead><tr>
@@ -302,6 +373,9 @@ const box = document.getElementById('runbox');
 const out = document.getElementById('runout');
 const title = document.getElementById('runtitle');
 let polling = null;
+// Reload only on a running -> finished transition this page actually saw.
+// Reloading whenever "not running" made every idle page reload itself forever.
+let sawRunning = false;
 
 function render(state, message) {
   if (state.running || (state.output && state.output.length)) box.classList.add('on');
@@ -325,8 +399,14 @@ async function poll() {
   const r = await fetch('/api/crawl/status');
   const state = await r.json();
   render(state);
-  if (!state.running) {
-    clearInterval(polling); polling = null;
+  if (state.running) {
+    sawRunning = true;
+    if (!polling) polling = setInterval(poll, 1500);
+    return;
+  }
+  if (polling) { clearInterval(polling); polling = null; }
+  if (sawRunning) {
+    sawRunning = false;
     // Crawl finished — reload so the tables and counters show the new data.
     setTimeout(() => location.reload(), 1200);
   }

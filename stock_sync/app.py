@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, render_template, request
 
-from encar_stock_sync import HERE, connect, load_specs
+from encar_stock_sync import HERE, PKG_DIR, connect, load_specs
 
 app = Flask(__name__)
 
@@ -75,7 +75,9 @@ def start_crawl(models: List[str]) -> Tuple[bool, str]:
         if proc is not None and proc.poll() is None:
             return False, "A crawl is already running."
 
-        cmd = [sys.executable, os.path.join(HERE, "encar_list_init.py"),
+        # The crawler sits next to this file in stock_sync/; HERE is the project
+        # root, which is where it should run so relative paths resolve as before.
+        cmd = [sys.executable, os.path.join(PKG_DIR, "encar_list_init.py"),
                "--log-file", LOG_PATH]
         for key in models:
             cmd += ["--model", key]
@@ -199,6 +201,50 @@ def listings():
         "index.html", view="listings", rows=rows, page=page, total=total or 0,
         page_size=PAGE_SIZE, models=model_options(),
         filters={"status": status, "model": model, "q": q}, stats=car_stats(),
+    )
+
+
+@app.route("/stock")
+def stock():
+    """Sonokong rent_product, with the sale status the Encar crawl implies."""
+    page, offset = paging()
+    status = request.args.get("status", "")
+    q = (request.args.get("q") or "").strip()
+    # The spec says "no Encar data => 판매완료". That is only sound for models the
+    # crawl covers, so UNKNOWN is separate by default and folded in on request.
+    strict = request.args.get("strict") == "1"
+
+    # QA placeholder plates cannot match anything; they are noise by default.
+    show_test = request.args.get("test") == "1"
+    where, params = ["1=1" if show_test else "plate_valid = 1"], []
+    if status in ("ON_SALE", "SOLD_OUT", "UNKNOWN"):
+        if strict and status == "SOLD_OUT":
+            where.append("status IN ('SOLD_OUT', 'UNKNOWN')")
+        else:
+            where.append("status = %s")
+            params.append(status)
+    if q:
+        where.append("(car_number LIKE %s OR model_info LIKE %s)")
+        params += [f"%{q}%", f"%{q}%"]
+    clause = " AND ".join(where)
+
+    total = scalar(f"SELECT COUNT(*) FROM stock_status WHERE {clause}", tuple(params))
+    rows = query(
+        f"SELECT * FROM stock_status WHERE {clause} "
+        f"ORDER BY FIELD(status,'ON_SALE','SOLD_OUT','UNKNOWN'), car_number "
+        f"LIMIT %s OFFSET %s",
+        tuple(params) + (PAGE_SIZE, offset),
+    )
+
+    counts = {r["status"]: r["n"] for r in query(
+        "SELECT status, COUNT(*) AS n FROM stock_status WHERE plate_valid = 1 GROUP BY status")}
+    counts["TEST"] = scalar("SELECT COUNT(*) FROM stock_status WHERE plate_valid = 0") or 0
+
+    return render_template(
+        "index.html", view="stock", rows=rows, page=page, total=total or 0,
+        page_size=PAGE_SIZE, models=model_options(),
+        filters={"status": status, "q": q, "model": ""},
+        stats=car_stats(), stock_counts=counts, strict=strict, show_test=show_test,
     )
 
 

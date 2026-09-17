@@ -88,6 +88,12 @@ from encar_stock_sync import (
 # sold. 1 restores the old mark-on-first-miss behaviour.
 SOLD_MISSING_STREAK = max(1, int(os.getenv("SOLD_MISSING_STREAK", "2")))
 
+# Pause between models. Crawling them back to back trips Encar's CloudFront
+# rate limit: after one ~1,200-request model the next one sat in 407 backoff
+# for ~5.5 min and only got through on its last retry. A deliberate pause is
+# far cheaper than that, and keeps a model from failing outright.
+MODEL_COOLDOWN = max(0.0, float(os.getenv("SYNC_MODEL_COOLDOWN", "60")))
+
 LOCK_NAME_PREFIX = "encar_list_init"
 
 UPSERT_SQL = """
@@ -421,7 +427,11 @@ def main() -> int:
     summaries: List[Dict[str, Any]] = []
     failed = False
     try:
-        for spec in specs:
+        for i, spec in enumerate(specs):
+            if i and MODEL_COOLDOWN:
+                log(f"\n  cooling down {MODEL_COOLDOWN:.0f}s before {spec['key']} "
+                    f"(SYNC_MODEL_COOLDOWN) ...")
+                time.sleep(MODEL_COOLDOWN)
             try:
                 summaries.append(run_model(conn, spec, args.details, args.detect_sold))
             except Exception as exc:  # one bad model must not kill the run

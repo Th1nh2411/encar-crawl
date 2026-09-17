@@ -66,3 +66,113 @@
 2026-09-10 17:00:28,236 bmw_3series_g20         OK       1179     1179     3        0      1m 20.51s
 2026-09-10 17:00:28,236 ================================================================================================
 2026-09-10 17:00:28,236 Total: 1m 20.51s
+2026-09-11 13:35:23,591 --- run started 2026-09-11T13:35:23 (log: /Users/nguyenthinh/WorkSpace/encar-crawl/status_crawl/logs/encar.log)
+2026-09-11 13:35:23,648 === BMW 3시리즈 (G20) (bmw_3series_g20) ===
+2026-09-11 13:35:23,660   batch #8
+2026-09-11 13:35:52,887   list: 1181 listings | 6/6 pages | Encar reports 1184
+2026-09-11 13:35:52,887   details: fetching 1181 vehicle(s) ...
+2026-09-11 13:37:14,654   details: 1181/1181 car numbers
+2026-09-11 13:37:14,797   stored 1181 row(s) in `vehicles`
+2026-09-11 13:37:14,801   status OK — 26 listing(s) missing this run, 0 reached 2 miss(es) and are now SOLD
+2026-09-11 13:37:14,804 === BMW X3 (G01) (bmw_x3_g01) ===
+2026-09-11 13:37:14,804   batch #9
+2026-09-11 13:37:15,209     ... offset=0 HTTP 407, retry in 49.2s
+2026-09-11 13:38:05,922     ... offset=0 HTTP 407, retry in 94.4s
+2026-09-11 13:39:42,120     ... offset=0 HTTP 407, retry in 180.6s
+2026-09-11 13:42:47,125   list: 629 listings | 4/4 pages | Encar reports 630
+2026-09-11 13:42:47,126   details: fetching 629 vehicle(s) ...
+2026-09-11 13:43:38,266   details: 629/629 car numbers
+2026-09-11 13:43:38,335   stored 629 row(s) in `vehicles`
+2026-09-11 13:43:38,341   status OK — 0 listing(s) missing this run, 0 reached 2 miss(es) and are now SOLD
+2026-09-11 13:43:38,344 === BMW X5 (G05) (bmw_x5_g05) ===
+2026-09-11 13:43:38,345   batch #10
+2026-09-11 13:43:38,769     ... offset=0 HTTP 407, retry in 47.7s
+2026-09-11 13:44:28,146     ... offset=0 HTTP 407, retry in 91.6s
+2026-09-11 13:46:01,404     ... offset=0 HTTP 407, retry in 183.7s
+2026-09-11 13:49:08,393   list: 1222 listings | 7/7 pages | Encar reports 1224
+2026-09-11 13:49:08,394   details: fetching 1222 vehicle(s) ...
+2026-09-11 13:50:25,759   details: 1222/1222 car numbers
+2026-09-11 13:50:25,884   stored 1222 row(s) in `vehicles`
+2026-09-11 13:50:25,896   status OK — 0 listing(s) missing this run, 0 reached 2 miss(es) and are now SOLD
+2026-09-11 13:50:25,898 ================================================================================================
+2026-09-11 13:50:25,899 MODEL                   STATUS   CRAWLED  CAR NO.  MISSING  SOLD   TIME      NOTE
+2026-09-11 13:50:25,899 ------------------------------------------------------------------------------------------------
+2026-09-11 13:50:25,899 bmw_3series_g20         OK       1181     1181     26       0      1m 51.16s
+2026-09-11 13:50:25,899 bmw_x3_g01              OK       629      629      0        0      6m 23.55s
+2026-09-11 13:50:25,899 bmw_x5_g05              OK       1222     1222     0        0      6m 47.56s
+2026-09-11 13:50:25,899 ================================================================================================
+2026-09-11 13:50:25,899 Total: 15m 2.27s
+2026-09-11 14:08:50,041 --- run started 2026-09-11T14:08:50 (log: /Users/nguyenthinh/WorkSpace/encar-crawl/status_crawl/logs/encar.log)
+2026-09-11 14:08:50,099 === 현대 더 뉴 그랜저 IG (hyundai_grandeur_ig_fl) ===
+2026-09-11 14:08:50,107   batch #11
+2026-09-11 14:08:54,544   list: 3055 listings | 16/16 pages | Encar reports 3061
+2026-09-11 14:08:54,544   details: fetching 3055 vehicle(s) ...
+2026-09-11 14:12:07,482   details: 3054/3055 car numbers
+2026-09-11 14:12:07,668   stored 3055 row(s) in `vehicles`
+2026-09-11 14:12:07,679   status OK — 0 listing(s) missing this run, 0 reached 2 miss(es) and are now SOLD
+2026-09-11 14:12:07,683   cooling down 60s before kgm_tivoli_very_new (SYNC_MODEL_COOLDOWN) ...
+2026-09-11 14:13:07,689 === KG모빌리티 베리 뉴 티볼리 (kgm_tivoli_very_new) ===
+2026-09-11 14:13:07,696   batch #12
+2026-09-11 14:13:08,393     ... offset=0 HTTP 407, retry in 49.2s
+2026-09-11 14:14:00,641   list: 653 listings | 4/4 pages | Encar reports 653
+2026-09-11 14:14:00,642   details: fetching 653 vehicle(s) ...
+2026-09-11 14:14:43,650   details: 653/653 car numbers
+2026-09-11 14:14:43,691   stored 653 row(s) in `vehicles`
+2026-09-11 14:14:43,696   status OK — 0 listing(s) missing this run, 0 reached 2 miss(es) and are now SOLD
+2026-09-11 14:14:43,702   cooling down 60s before kia_carnival_ka4 (SYNC_MODEL_COOLDOWN) ...
+2026-09-11 14:15:43,708 === 기아 카니발 4세대 (KA4) (kia_carnival_ka4) ===
+2026-09-11 14:15:43,715   batch #13
+2026-09-11 14:15:43,868     ... offset=0 HTTP 407, retry in 47.4s
+2026-09-11 14:16:32,713     ... offset=0 HTTP 407, retry in 94.7s
+2026-09-11 14:17:50,459 --- run started 2026-09-11T14:17:50 (log: /Users/nguyenthinh/WorkSpace/encar-crawl/status_crawl/logs/encar.log)
+2026-09-11 14:17:50,497 Another run holds 'encar_list_init:encar' — exiting without crawling.
+2026-09-11 14:17:54,349 --- run started 2026-09-11T14:17:54 (log: /Users/nguyenthinh/WorkSpace/encar-crawl/status_crawl/logs/encar.log)
+2026-09-11 14:17:54,371 Another run holds 'encar_list_init:encar' — exiting without crawling.
+2026-09-11 14:18:09,124     ... offset=0 HTTP 407, retry in 183.7s
+2026-09-11 14:21:17,923   list: 4227 listings | 22/22 pages | Encar reports 4254
+2026-09-11 14:21:17,923   details: fetching 4227 vehicle(s) ...
+2026-09-11 14:25:54,286   details: 4225/4227 car numbers
+2026-09-11 14:25:54,572   stored 4227 row(s) in `vehicles`
+2026-09-11 14:25:54,590   status OK — 0 listing(s) missing this run, 0 reached 2 miss(es) and are now SOLD
+2026-09-11 14:25:54,593   cooling down 60s before genesis_g80_rg3 (SYNC_MODEL_COOLDOWN) ...
+2026-09-11 14:26:54,599 === 제네시스 G80 (RG3) (genesis_g80_rg3) ===
+2026-09-11 14:26:54,615   batch #14
+2026-09-11 14:26:58,621   list: 2935 listings | 15/15 pages | Encar reports 2942
+2026-09-11 14:26:58,621   details: fetching 2935 vehicle(s) ...
+2026-09-11 14:30:04,959   details: 2934/2935 car numbers
+2026-09-11 14:30:05,144   stored 2935 row(s) in `vehicles`
+2026-09-11 14:30:05,161   status OK — 0 listing(s) missing this run, 0 reached 2 miss(es) and are now SOLD
+2026-09-11 14:30:05,163   cooling down 60s before hyundai_avante_cn7_fl (SYNC_MODEL_COOLDOWN) ...
+2026-09-11 14:31:05,181 === 현대 더 뉴 아반떼 (CN7) (hyundai_avante_cn7_fl) ===
+2026-09-11 14:31:05,189   batch #15
+2026-09-11 14:31:05,948     ... offset=0 HTTP 407, retry in 46.2s
+2026-09-11 14:31:53,639     ... offset=0 HTTP 407, retry in 93.9s
+2026-09-11 14:33:31,061   list: 662 listings | 4/4 pages | Encar reports 662
+2026-09-11 14:33:31,061   details: fetching 662 vehicle(s) ...
+2026-09-11 14:34:19,432   details: 662/662 car numbers
+2026-09-11 14:34:19,512   stored 662 row(s) in `vehicles`
+2026-09-11 14:34:19,520   status OK — 0 listing(s) missing this run, 0 reached 2 miss(es) and are now SOLD
+2026-09-11 14:34:19,524 ================================================================================================
+2026-09-11 14:34:19,524 MODEL                   STATUS   CRAWLED  CAR NO.  MISSING  SOLD   TIME      NOTE
+2026-09-11 14:34:19,525 ------------------------------------------------------------------------------------------------
+2026-09-11 14:34:19,525 hyundai_grandeur_ig_fl  OK       3055     3054     0        0      3m 17.59s
+2026-09-11 14:34:19,525 kgm_tivoli_very_new     OK       653      653      0        0      1m 36.01s
+2026-09-11 14:34:19,525 kia_carnival_ka4        OK       4227     4225     0        0      10m 10.98s
+2026-09-11 14:34:19,525 genesis_g80_rg3         OK       2935     2934     0        0      3m 10.57s
+2026-09-11 14:34:19,525 hyundai_avante_cn7_fl   OK       662      662      0        0      3m 14.34s
+2026-09-11 14:34:19,525 ================================================================================================
+2026-09-11 14:34:19,525 Total: 25m 29.52s
+2026-09-11 14:56:54,130 --- run started 2026-09-11T14:56:54 (log: /Users/nguyenthinh/WorkSpace/encar-crawl/status_crawl/logs/encar.log)
+2026-09-11 14:56:54,261 === BMW 3시리즈 (G20) (bmw_3series_g20) ===
+2026-09-11 14:56:54,269   batch #16
+2026-09-11 14:56:57,506   list: 1180 listings | 6/6 pages | Encar reports 1180
+2026-09-11 14:56:57,506   details: fetching 1180 vehicle(s) ...
+2026-09-11 14:58:17,759   details: 1180/1180 car numbers
+2026-09-11 14:58:17,980   stored 1180 row(s) in `vehicles`
+2026-09-11 14:58:17,987   status OK — 32 listing(s) missing this run, 23 reached 2 miss(es) and are now SOLD
+2026-09-11 14:58:17,990 ================================================================================================
+2026-09-11 14:58:17,990 MODEL                   STATUS   CRAWLED  CAR NO.  MISSING  SOLD   TIME      NOTE
+2026-09-11 14:58:17,990 ------------------------------------------------------------------------------------------------
+2026-09-11 14:58:17,990 bmw_3series_g20         OK       1180     1180     32       23     1m 23.73s
+2026-09-11 14:58:17,990 ================================================================================================
+2026-09-11 14:58:17,990 Total: 1m 23.73s

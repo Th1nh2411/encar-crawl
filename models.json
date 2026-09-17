@@ -6,21 +6,5 @@
     "model_group": "3시리즈",
     "model": "3시리즈 (G20_)",
     "stock_filter": "s.model_code = 'G20'"
-  },
-  {
-    "key": "bmw_x3_g01",
-    "label": "BMW X3 (G01)",
-    "manufacturer": "BMW",
-    "model_group": "X3",
-    "model": "X3 (G01_)",
-    "stock_filter": "s.model_code = 'G01'"
-  },
-  {
-    "key": "bmw_x5_g05",
-    "label": "BMW X5 (G05)",
-    "manufacturer": "BMW",
-    "model_group": "X5",
-    "model": "X5 (G05_)",
-    "stock_filter": "s.model_code = 'G05'"
   }
 ]
