@@ -1,5 +1,7 @@
 {
   "extraPaths": [
-    "quick_crawl"
+    "listing_export",
+    "brightdata_collector",
+    "stock_pipeline"
   ]
 }

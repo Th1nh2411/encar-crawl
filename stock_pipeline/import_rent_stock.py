@@ -1,5 +1,5 @@
 """
-import_rent_product.py — Load the sonokong `product_group` and `rent_product`
+import_rent_stock.py — Load the sonokong `product_group` and `rent_product`
 dumps into MySQL.
 
 Both dumps are data-only: `INSERT INTO <table> VALUES (...)` with no column
@@ -17,10 +17,10 @@ dashboard's queries flat.
 Only live stock is imported (`is_del = 0`) — a soft-deleted car is out of
 inventory, so whether Encar still lists it is not a question worth asking.
 
-    python migrate.py
-    python import_rent_product.py
-    python import_rent_product.py --all          # include is_del = 1
-    python import_rent_product.py --dry-run
+    python stock_pipeline/migrate.py
+    python stock_pipeline/import_rent_stock.py
+    python stock_pipeline/import_rent_stock.py --all      # include is_del = 1
+    python stock_pipeline/import_rent_stock.py --dry-run
 """
 
 import argparse
@@ -31,7 +31,9 @@ import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from encar_stock_sync import HERE, connect, log
+from config import MIGRATIONS_DIR
+from db import connect
+from run_log import log
 
 TUPLE_RE = re.compile(r"\((.*?)\)(?=,\(|$)", re.S)
 COL_RE = re.compile(r"^\s*`([A-Za-z0-9_]+)`\s", re.M)
@@ -204,7 +206,7 @@ def load_table(dump: str, sch: str, table: str) -> Tuple[List[Dict[str, Any]], L
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Import the sonokong product_group and rent_product dumps.")
-    parser.add_argument("--dir", default=HERE, help="Where the .sql.gz and .sch files live")
+    parser.add_argument("--dir", default=MIGRATIONS_DIR, help="Where the .sql.gz and .sch files live")
     parser.add_argument("--all", action="store_true",
                         help="Import soft-deleted stock too (default: is_del = 0 only)")
     parser.add_argument("--dry-run", action="store_true", help="Parse and report, write nothing")

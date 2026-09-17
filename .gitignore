@@ -1,2 +1,29 @@
+# Secrets and local config
 .env
-**/output/
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Run artefacts: output/<tool>/<name>_<timestamp>.{json,csv} and the run log
+output/
+logs/
+*.log
+
+# Ad-hoc exports that predate output/
+/out.json
+/out.csv
+
+# OS and editor
+.DS_Store
+.idea/
+.vscode/

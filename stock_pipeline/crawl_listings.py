@@ -1,14 +1,14 @@
 """
-encar_list_init.py — One-off / re-runnable seed crawl of the Encar listings for
-the models in models.json, into the `vehicles` master table.
+crawl_listings.py — The recurring crawl of the Encar listings for the models in
+models.json, into the `vehicles` master table.
 
-This is the *init* half of the pipeline and does nothing with `stock`:
-encar_stock_sync.py owns the recurring sold-detection run and its safeguards.
-Here the goal is simply to have a full, current list of the vehicles Encar
-advertises for a model, with the car number and the model information.
+This is the half of the pipeline that owns `vehicles` and touches nothing else:
+sync_sold.py owns the comparison against someone else's `stock` table. Here the
+goal is a full, current list of the vehicles Encar advertises for a model, with
+the car number and the model information.
 
-    list API  -> listing ids + model/price/mileage  (1 request per 200 cars)
-    detail API-> vehicle number + grade/color        (1 request per car)
+    listing API -> listing ids + model/price/mileage  (1 request per 200 cars)
+    detail API  -> vehicle number + grade/color       (1 request per car)
 
 The vehicle number only exists on the detail endpoint, so the detail pass is
 mandatory for the car-number requirement; use --no-details to skip it when you
@@ -27,15 +27,14 @@ streak reaches SOLD_MISSING_STREAK (default 2) does the row become
 dealer can pause an ad, and a short page still answers HTTP 200. A listing that
 comes back resets its streak and returns to ACTIVE.
 
-Nothing is marked unless the run passes encar_stock_sync.evaluate() — the same
-gate the sync run uses (completion_rate >= 99%, no zero-row batch, no >50% drop
-against the previous OK batch). A blocked or half-finished crawl stores its rows
-and skips the marking; the next healthy run does it. `--no-sold` disables it.
+Nothing is marked unless the run passes guards.evaluate_batch() — the same gate
+sync_sold.py uses. A blocked or half-finished crawl stores its rows and skips
+the marking; the next healthy run does it. `--no-sold` disables it.
 
 Running daily
 -------------
-    python migrate.py
-    python encar_list_init.py --log-file logs/encar.log
+    python stock_pipeline/migrate.py
+    python stock_pipeline/crawl_listings.py --log-file logs/encar.log
 
 One run at a time is enforced with a MySQL advisory lock, so an overlapping
 cron start exits with code 2 instead of racing the run in flight. Exit codes:
@@ -47,13 +46,12 @@ really sold once every one of them is gone.
 
 Usage
 -----
-    python encar_list_init.py --model bmw_3series_g20
-    python encar_list_init.py                       # every model in models.json
-    python encar_list_init.py --model bmw_x3_g01 --no-db --json out/x3.json
+    python stock_pipeline/crawl_listings.py --model bmw_3series_g20
+    python stock_pipeline/crawl_listings.py                 # every model
+    python stock_pipeline/crawl_listings.py --model bmw_x3_g01 --no-db --out-dir
 """
 
 import argparse
-import json
 import math
 import os
 import sys
@@ -62,39 +60,40 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from encar_stock_sync import (
-    HERE,
-    PAGE_SIZE,
-    LIST_WORKERS,
+import results
+from config import (
     DETAIL_WORKERS,
+    LIST_WORKERS,
+    MODEL_COOLDOWN,
+    MODELS_FILE,
+    PAGE_SIZE,
+    ROOT_DIR,
+    SOLD_MISSING_STREAK,
+)
+from db import (
     acquire_lock,
-    build_query,
     close_batch,
     connect,
-    db_lock_name,
-    evaluate,
-    fetch_detail,
-    fetch_page,
-    fmt_duration,
-    load_specs,
-    log,
+    fail_batch,
+    lock_name,
     open_batch,
     previous_ok_count,
     release_lock,
-    setup_file_log,
 )
+from encar_api import (
+    detail_model_info,
+    fetch_listing_page,
+    fetch_vehicle_detail,
+    listing_model_info,
+    model_query,
+)
+from guards import evaluate_batch
+from models import load_specs
+from run_log import fmt_duration, log, setup_file_log
 
-# How many consecutive healthy crawls must miss a listing before it counts as
-# sold. 1 restores the old mark-on-first-miss behaviour.
-SOLD_MISSING_STREAK = max(1, int(os.getenv("SOLD_MISSING_STREAK", "2")))
-
-# Pause between models. Crawling them back to back trips Encar's CloudFront
-# rate limit: after one ~1,200-request model the next one sat in 407 backoff
-# for ~5.5 min and only got through on its last retry. A deliberate pause is
-# far cheaper than that, and keeps a model from failing outright.
-MODEL_COOLDOWN = max(0.0, float(os.getenv("SYNC_MODEL_COOLDOWN", "60")))
-
-LOCK_NAME_PREFIX = "encar_list_init"
+TOOL = "crawl_listings"
+DEFAULT_OUT_DIR = os.path.join(ROOT_DIR, "output", TOOL)
+LOCK_PREFIX = "crawl_listings"
 
 UPSERT_SQL = """
 INSERT INTO vehicles
@@ -158,17 +157,15 @@ def as_int(value: Any) -> Optional[int]:
         return None
 
 
-def base_row(item: Dict[str, Any], model_key: str) -> Dict[str, Any]:
+# ── Row shaping ───────────────────────────────────────────────────────────────
+def listing_row(item: Dict[str, Any], model_key: str) -> Dict[str, Any]:
     """The fields the listing API already gives us."""
-    model_info = " ".join(
-        str(p) for p in (item.get("Manufacturer"), item.get("Model"), item.get("Badge")) if p
-    ).strip()
     year = str(item.get("Year") or "")
     return {
         "car_id": str(item.get("Id")),
         "vehicle_no": None,
         "model_key": model_key,
-        "model_info": model_info or None,
+        "model_info": listing_model_info(item),
         "manufacturer": item.get("Manufacturer"),
         "model_group": None,
         "model_name": item.get("Model"),
@@ -211,37 +208,31 @@ def apply_detail(row: Dict[str, Any], detail: Dict[str, Any]) -> None:
     if mileage is not None:
         row["mileage"] = mileage
 
-    parts = [
-        category.get("manufacturerName"),
-        category.get("modelName"),
-        category.get("gradeName"),
-        category.get("gradeDetailName"),
-    ]
-    model_info = " ".join(str(p) for p in parts if p).strip()
-    if model_info:
-        row["model_info"] = model_info
+    row["model_info"] = detail_model_info(detail) or row["model_info"]
 
 
-def crawl_list(spec: Dict[str, str]) -> Tuple[List[Dict[str, Any]], int, int, int]:
+# ── Crawl ─────────────────────────────────────────────────────────────────────
+def crawl_listing_pages(spec: Dict[str, str]) -> Tuple[List[Dict[str, Any]], int, int, int]:
     """-> (rows, total_count, total_pages, fetched_pages)"""
-    query = build_query(spec)
-    first = fetch_page(query, 0, PAGE_SIZE, want_count=True)
+    query = model_query(spec)
+    first = fetch_listing_page(query, 0, PAGE_SIZE, want_count=True)
     total_count = int(first.get("Count") or 0)
     total_pages = max(1, math.ceil(total_count / PAGE_SIZE)) if total_count else 0
 
     rows: Dict[str, Dict[str, Any]] = {}
     for item in first.get("SearchResults") or []:
-        row = base_row(item, spec["key"])
+        row = listing_row(item, spec["key"])
         rows[row["car_id"]] = row
     fetched_pages = 1 if total_pages else 0
 
     if total_pages > 1:
         def work(offset: int) -> Optional[List[Dict[str, Any]]]:
             try:
-                return fetch_page(query, offset, PAGE_SIZE, want_count=False).get("SearchResults") or []
+                page = fetch_listing_page(query, offset, PAGE_SIZE, want_count=False)
             except RuntimeError as exc:
                 log(f"    ! page offset={offset} failed: {exc}")
                 return None
+            return page.get("SearchResults") or []
 
         offsets = [p * PAGE_SIZE for p in range(1, total_pages)]
         with ThreadPoolExecutor(max_workers=LIST_WORKERS) as pool:
@@ -250,16 +241,16 @@ def crawl_list(spec: Dict[str, str]) -> Tuple[List[Dict[str, Any]], int, int, in
                     continue
                 fetched_pages += 1
                 for item in items:
-                    row = base_row(item, spec["key"])
+                    row = listing_row(item, spec["key"])
                     rows[row["car_id"]] = row
 
     return list(rows.values()), total_count, total_pages, fetched_pages
 
 
-def crawl_details(rows: List[Dict[str, Any]]) -> int:
+def fill_vehicle_details(rows: List[Dict[str, Any]]) -> int:
     """Fill the car number + detail fields. Returns how many plates we got."""
     def work(row: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
-        return row, fetch_detail(row["car_id"])
+        return row, fetch_vehicle_detail(row["car_id"])
 
     filled = 0
     with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:
@@ -272,13 +263,16 @@ def crawl_details(rows: List[Dict[str, Any]]) -> int:
     return filled
 
 
-def store(cur, rows: List[Dict[str, Any]], batch_id: Optional[int], seen_at: datetime) -> None:
+# ── Store ─────────────────────────────────────────────────────────────────────
+def upsert_vehicles(cur, rows: List[Dict[str, Any]], batch_id: Optional[int],
+                    seen_at: datetime) -> None:
     if not rows:
         return
     cur.executemany(UPSERT_SQL, [dict(r, batch_id=batch_id, seen_at=seen_at) for r in rows])
 
 
-def mark_sold(cur, model_key: str, batch_id: int, detected_at: datetime) -> Tuple[int, int]:
+def mark_missing_sold(cur, model_key: str, batch_id: int,
+                      detected_at: datetime) -> Tuple[int, int]:
     """-> (listings that were missing this run, listings flipped to SOLD)"""
     cur.execute(BUMP_MISSING_SQL, (detected_at, model_key, batch_id))
     missing = int(cur.rowcount)
@@ -286,21 +280,9 @@ def mark_sold(cur, model_key: str, batch_id: int, detected_at: datetime) -> Tupl
     return missing, int(cur.rowcount)
 
 
-def fail_batch(conn, cur, batch_id: int, note: str) -> None:
-    """Close a batch as FAILED. Best effort: never mask the original error."""
-    try:
-        conn.rollback()
-        cur.execute(
-            "UPDATE crawl_batches SET finished_at = %s, status = 'FAILED', note = %s "
-            "WHERE id = %s AND status = 'RUNNING'",
-            (datetime.now(), note[:500], batch_id),
-        )
-        conn.commit()
-    except Exception as exc:
-        log(f"  ! could not close batch #{batch_id}: {type(exc).__name__}: {exc}")
-
-
-def run_model(conn, spec: Dict[str, str], with_details: bool, detect_sold: bool) -> Dict[str, Any]:
+# ── Run ───────────────────────────────────────────────────────────────────────
+def run_model(conn, spec: Dict[str, str], with_details: bool,
+              detect_sold: bool) -> Dict[str, Any]:
     log(f"\n=== {spec['label']} ({spec['key']}) ===")
     started = time.perf_counter()
     seen_at = datetime.now()
@@ -313,26 +295,26 @@ def run_model(conn, spec: Dict[str, str], with_details: bool, detect_sold: bool)
         log(f"  batch #{batch_id}")
 
     try:
-        rows, total_count, total_pages, fetched_pages = crawl_list(spec)
+        rows, total_count, total_pages, fetched_pages = crawl_listing_pages(spec)
         log(f"  list: {len(rows)} listings | {fetched_pages}/{total_pages} pages "
             f"| Encar reports {total_count}")
 
         filled = 0
         if with_details and rows:
             log(f"  details: fetching {len(rows)} vehicle(s) ...")
-            filled = crawl_details(rows)
+            filled = fill_vehicle_details(rows)
             log(f"  details: {filled}/{len(rows)} car numbers")
     except BaseException as exc:
         # A crashed run must not leave its batch sitting at RUNNING forever —
         # that would make the log claim a crawl is still in flight.
         if cur and batch_id is not None:
-            fail_batch(conn, cur, batch_id, f"{type(exc).__name__}: {exc}")
+            fail_batch(conn, cur, batch_id, f"{type(exc).__name__}: {exc}", log)
             log(f"  batch #{batch_id} closed as FAILED")
         raise
 
-    # Shape the crawl metrics the way encar_stock_sync.evaluate() expects, so the
-    # sold-detection gate here is literally the same gate the sync run uses.
-    crawl = {
+    # Shaped the way guards.evaluate_batch() expects, so the sold-detection gate
+    # here is literally the same gate the sync run uses.
+    metrics = {
         "rows": rows,
         "total_expected_count": total_count,
         "total_expected_pages": total_pages,
@@ -346,40 +328,42 @@ def run_model(conn, spec: Dict[str, str], with_details: bool, detect_sold: bool)
         "crawled_count": len(rows),
         "total_expected_count": total_count,
         "fetched_pages": fetched_pages,
-        "total_pages": total_pages,
-        "completion_rate": crawl["completion_rate"],
+        "total_expected_pages": total_pages,
+        "completion_rate": metrics["completion_rate"],
         "vehicle_no_filled": filled,
+        "missing_now": 0,
         "sold_marked": 0,
-        "rows": rows,
+        "listings": rows,
     }
 
     if not cur:
-        status, _, note = evaluate(crawl, None)
+        status, _, note = evaluate_batch(metrics, None)
         summary.update(status=status, note=note, elapsed=time.perf_counter() - started)
         log(f"  status {status}" + (f" — {note}" if note else ""))
         return summary
 
+    assert batch_id is not None  # opened together with `cur`
     try:
-        status, may_mark, note = evaluate(crawl, previous_ok_count(cur, spec["key"]))
+        status, may_mark, note = evaluate_batch(metrics, previous_ok_count(cur, spec["key"]))
         if not detect_sold:
             may_mark = False
             note = note or "sold detection disabled (--no-sold)"
 
-        store(cur, rows, batch_id, seen_at)
+        upsert_vehicles(cur, rows, batch_id, seen_at)
         log(f"  stored {len(rows)} row(s) in `vehicles`")
 
         sold = missing = 0
         if may_mark:
-            missing, sold = mark_sold(cur, spec["key"], batch_id, seen_at)
+            missing, sold = mark_missing_sold(cur, spec["key"], batch_id, seen_at)
             log(f"  status OK — {missing} listing(s) missing this run, "
                 f"{sold} reached {SOLD_MISSING_STREAK} miss(es) and are now SOLD")
         else:
             log(f"  status {status} — sold detection skipped: {note}")
 
-        close_batch(cur, batch_id, crawl, status, may_mark, sold, note)
+        close_batch(cur, batch_id, metrics, status, may_mark, sold, note)
         conn.commit()
     except BaseException as exc:
-        fail_batch(conn, cur, batch_id, f"{type(exc).__name__}: {exc}")
+        fail_batch(conn, cur, batch_id, f"{type(exc).__name__}: {exc}", log)
         log(f"  batch #{batch_id} closed as FAILED")
         raise
 
@@ -388,11 +372,24 @@ def run_model(conn, spec: Dict[str, str], with_details: bool, detect_sold: bool)
     return summary
 
 
+def print_summary(summaries: List[Dict[str, Any]], elapsed: float) -> None:
+    log("\n" + "=" * 96)
+    log(f"{'MODEL':<24}{'STATUS':<9}{'CRAWLED':<9}{'CAR NO.':<9}{'MISSING':<9}"
+        f"{'SOLD':<7}{'TIME':<10}NOTE")
+    log("-" * 96)
+    for s in summaries:
+        log(f"{s['model_key']:<24}{s.get('status', '-'):<9}{s['crawled_count']:<9}"
+            f"{s['vehicle_no_filled']:<9}{s['missing_now']:<9}{s['sold_marked']:<7}"
+            f"{fmt_duration(s['elapsed']):<10}{s.get('note', '')}")
+    log("=" * 96)
+    log(f"Total: {fmt_duration(elapsed)}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Seed the `vehicles` table with the current Encar listings for each model."
+        description="Crawl the current Encar listings for each model into `vehicles`."
     )
-    parser.add_argument("--models-file", default=os.path.join(HERE, "models.json"))
+    parser.add_argument("--models-file", default=MODELS_FILE)
     parser.add_argument("--model", action="append", default=[],
                         help="Model key to crawl (repeatable). Default: every model in models.json")
     parser.add_argument("--no-details", dest="details", action="store_false",
@@ -400,7 +397,13 @@ def main() -> int:
     parser.add_argument("--no-sold", dest="detect_sold", action="store_false",
                         help="Store the listings only — do not flag missing ones as SOLD")
     parser.add_argument("--no-db", action="store_true", help="Crawl only, no DB writes")
-    parser.add_argument("--json", dest="json_out", help="Write the crawl snapshot to this file")
+    parser.add_argument("--json", dest="json_out", help="Write the run summary to this JSON file")
+    parser.add_argument("--csv", dest="csv_out", help="Write one summary row per model here")
+    parser.add_argument("--out-dir", nargs="?", const=DEFAULT_OUT_DIR,
+                        help=f"Write both, named <run>_<timestamp> in this directory "
+                             f"(default: {os.path.relpath(DEFAULT_OUT_DIR, ROOT_DIR)})")
+    parser.add_argument("--listings", action="store_true",
+                        help="Include every crawled listing in the JSON (large)")
     parser.add_argument("--log-file", default=os.getenv("LOG_FILE"),
                         help="Also append the run log here, rotating (default: $LOG_FILE)")
     parser.add_argument("--lock-timeout", type=int, default=int(os.getenv("LOCK_TIMEOUT", "0")),
@@ -415,12 +418,12 @@ def main() -> int:
     specs = load_specs(args.models_file, args.model)
     conn = None if args.no_db else connect()
 
-    lock_name = db_lock_name(LOCK_NAME_PREFIX)
-    if conn and not acquire_lock(conn, lock_name, args.lock_timeout):
+    name = lock_name(LOCK_PREFIX)
+    if conn and not acquire_lock(conn, name, args.lock_timeout):
         conn.close()
         # Yesterday's run is still going. Two concurrent runs would open rival
         # batches and mark each other's listings missing.
-        log(f"Another run holds {lock_name!r} — exiting without crawling.")
+        log(f"Another run holds {name!r} — exiting without crawling.")
         return 2
 
     started = time.perf_counter()
@@ -441,29 +444,21 @@ def main() -> int:
                     conn.rollback()
     finally:
         if conn:
-            release_lock(conn, lock_name)
+            release_lock(conn, name)
             conn.close()
 
-    log("\n" + "=" * 96)
-    log(f"{'MODEL':<24}{'STATUS':<9}{'CRAWLED':<9}{'CAR NO.':<9}{'MISSING':<9}"
-        f"{'SOLD':<7}{'TIME':<10}NOTE")
-    log("-" * 96)
-    for s in summaries:
-        log(f"{s['model_key']:<24}{s.get('status', '-'):<9}{s['crawled_count']:<9}"
-            f"{s['vehicle_no_filled']:<9}{s.get('missing_now', 0):<9}{s['sold_marked']:<7}"
-            f"{fmt_duration(s['elapsed']):<10}{s.get('note', '')}")
-    log("=" * 96)
-    log(f"Total: {fmt_duration(time.perf_counter() - started)}")
+    elapsed = time.perf_counter() - started
+    print_summary(summaries, elapsed)
 
-    if args.json_out:
-        os.makedirs(os.path.dirname(os.path.abspath(args.json_out)) or ".", exist_ok=True)
-        with open(args.json_out, "w", encoding="utf-8") as f:
-            json.dump(
-                {"crawledAt": datetime.now().astimezone().isoformat(timespec="seconds"),
-                 "models": summaries},
-                f, ensure_ascii=False, indent=2,
-            )
-        log(f"Wrote snapshot: {args.json_out}")
+    if args.json_out or args.csv_out or args.out_dir:
+        rows = [{k: v for k, v in s.items() if k != "listings" or args.listings}
+                for s in summaries]
+        for path in results.save(
+            TOOL, "run", rows,
+            {"models": len(summaries), "elapsedSeconds": round(elapsed, 2)},
+            json_path=args.json_out, csv_path=args.csv_out, out_dir=args.out_dir,
+        ):
+            log(f"Wrote {path}")
 
     return 1 if failed else 0
 

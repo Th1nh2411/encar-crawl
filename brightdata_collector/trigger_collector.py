@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-run_collector.py -- Trigger the Bright Data collector and save what it returns.
+trigger_collector.py -- Trigger the Bright Data collector and save what it returns.
 
-    python scrapper/run_collector.py                    # bmw_3series_g20, 10 pages
-    python scrapper/run_collector.py --max-page 3
-    python scrapper/run_collector.py --model bmw_3series_g20 --timeout 900
-    python scrapper/run_collector.py --collection-id c_xxx   # fetch an old run
+    python brightdata_collector/trigger_collector.py                  # 10 pages
+    python brightdata_collector/trigger_collector.py --max-page 3
+    python brightdata_collector/trigger_collector.py --timeout 900
+    python brightdata_collector/trigger_collector.py --collection-id c_xxx
 
 This is the same call as the documented curl:
 
@@ -15,11 +15,13 @@ This is the same call as the documented curl:
 and then it polls for the result instead of leaving you to check by hand.
 
 The token comes from API_TOKEN_BRINGDATA in the project-root .env -- the same
-one the zone calls use. Results land in output/ as both .json (what
-the collector actually returned, untouched) and .csv (car_number, model_info),
-named after the model and the time, so runs do not overwrite each other.
+one the zone calls use. Results land in output/brightdata_collector/ as both
+.json and .csv, named after the model and the time so runs do not overwrite
+each other -- the same document shape listing_export and stock_pipeline write
+(see results.py). The collector's untouched rows are kept in the JSON under
+`collectorRows`, so nothing it returned is lost to the row mapping.
 
-The search URL is built by the same code quick_crawl uses, which matters: the
+The search URL is built by the same code listing_export uses, which matters: the
 page's router only accepts its own spelling of the `#!{...}` hash -- no spaces
 after ':' or ',', parentheses left literal. A hash built with plain
 json.dumps() loads the page and silently never runs a search.
@@ -28,26 +30,29 @@ json.dumps() loads the page and silently never runs a search.
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 import sys
 import time
-from datetime import datetime
 from typing import Any, Dict, List
 
 import requests
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-OUT_DIR = os.path.join(ROOT, "output")
+PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(PKG_DIR)
 
-# quick_crawl owns the query building; no reason to have a second copy that can
-# drift from it.
-sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.join(ROOT, "quick_crawl"))
-from quick_crawl.crawl import build_query, load_spec  # noqa: E402
-from quick_crawl.page_source import search_url  # noqa: E402
+TOOL = "brightdata_collector"
+DEFAULT_OUT_DIR = os.path.join(ROOT_DIR, "output", TOOL)
+
+sys.path.insert(0, PKG_DIR)
+import results  # noqa: E402
+
+# listing_export owns the query and URL building; no reason to have a second
+# copy here that can drift from it.
+sys.path.insert(0, ROOT_DIR)
+sys.path.insert(0, os.path.join(ROOT_DIR, "listing_export"))
+from listing_export.export_listings import model_query, load_model_spec  # noqa: E402
+from listing_export.browser_source import search_page_url  # noqa: E402
 
 try:
     from dotenv import load_dotenv
@@ -55,7 +60,7 @@ except ImportError:  # dotenv is optional
     def load_dotenv(*_a, **_kw):  # type: ignore
         return False
 
-load_dotenv(os.path.join(ROOT, ".env"))
+load_dotenv(os.path.join(ROOT_DIR, ".env"))
 
 TRIGGER_URL = "https://api.brightdata.com/dca/trigger"
 DATASET_URL = "https://api.brightdata.com/dca/dataset"
@@ -74,25 +79,25 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-def token() -> str:
+def api_token() -> str:
     value = (os.getenv("API_TOKEN_BRINGDATA") or "").strip()
     if not value:
         raise SystemExit("API_TOKEN_BRINGDATA is not set in .env")
     return value
 
 
-def session() -> requests.Session:
+def make_session() -> requests.Session:
     s = requests.Session()
     # macOS system proxy settings otherwise leak in and break these calls.
     s.trust_env = False
     s.headers.update({
-        "Authorization": f"Bearer {token()}",
+        "Authorization": f"Bearer {api_token()}",
         "Content-Type": "application/json",
     })
     return s
 
 
-def trigger(s: requests.Session, collector: str, url: str,
+def trigger_run(s: requests.Session, collector: str, url: str,
             max_page: int, override_schema: bool = False) -> str:
     """Start a run and return its collection id.
 
@@ -117,7 +122,7 @@ def trigger(s: requests.Session, collector: str, url: str,
                 "retrying with override_incompatible_schema=1")
             log("  (fix the schema in the IDE -- the override drops fields "
                 "that do not fit)")
-            return trigger(s, collector, url, max_page, override_schema=True)
+            return trigger_run(s, collector, url, max_page, override_schema=True)
 
     if resp.status_code != 200:
         raise SystemExit(f"Trigger failed: HTTP {resp.status_code} {resp.text[:300]}")
@@ -131,7 +136,7 @@ def trigger(s: requests.Session, collector: str, url: str,
     raise SystemExit(f"No collection id in trigger response: {json.dumps(data)[:300]}")
 
 
-def decode_body(text: str):
+def parse_result_body(text: str):
     """Parse a result body, which is NDJSON as often as it is JSON.
 
     Finished runs come back as one JSON object per line rather than as an
@@ -159,7 +164,7 @@ def decode_body(text: str):
     return rows
 
 
-def poll(s: requests.Session, collection_id: str,
+def wait_for_rows(s: requests.Session, collection_id: str,
          timeout: float) -> List[Dict[str, Any]]:
     """Wait for the run to finish and return its rows.
 
@@ -171,7 +176,7 @@ def poll(s: requests.Session, collection_id: str,
         resp = s.get(DATASET_URL, params={"id": collection_id}, timeout=60)
 
         if resp.status_code == 200:
-            data = decode_body(resp.text)
+            data = parse_result_body(resp.text)
             if data is None:
                 raise SystemExit(f"Could not read the result: {resp.text[:300]}")
             if isinstance(data, dict):
@@ -200,7 +205,7 @@ def poll(s: requests.Session, collection_id: str,
         time.sleep(POLL_INTERVAL)
 
 
-def rows_of(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def to_rows(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The two requested fields, plus the source URL for traceability."""
     out: List[Dict[str, Any]] = []
     for item in raw:
@@ -212,27 +217,6 @@ def rows_of(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "product_page_url": item.get("product_page_url"),
         })
     return out
-
-
-def write_output(model: str, collection_id: str, raw: List[Dict[str, Any]],
-                 rows: List[Dict[str, Any]]) -> None:
-    os.makedirs(OUT_DIR, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = os.path.join(OUT_DIR, f"{model}_{stamp}")
-
-    with open(f"{base}.json", "w", encoding="utf-8") as fh:
-        json.dump({"collection_id": collection_id, "count": len(rows),
-                   "rows": raw}, fh, ensure_ascii=False, indent=2)
-
-    # utf-8-sig so Excel opens the Korean plates and model names correctly.
-    with open(f"{base}.csv", "w", encoding="utf-8-sig", newline="") as fh:
-        writer = csv.DictWriter(
-            fh, fieldnames=["car_number", "model_info", "product_page_url"])
-        writer.writeheader()
-        writer.writerows(rows)
-
-    log(f"  wrote {base}.json")
-    log(f"  wrote {base}.csv")
 
 
 def main() -> int:
@@ -253,31 +237,58 @@ def main() -> int:
     parser.add_argument("--collection-id",
                         help="skip the trigger and fetch this existing run")
     parser.add_argument("--url", help="override the search URL entirely")
+    parser.add_argument("--json", dest="json_out",
+                        help="write the run to this JSON file")
+    parser.add_argument("--csv", dest="csv_out",
+                        help="write the rows to this CSV file")
+    parser.add_argument("--out-dir", nargs="?", const=DEFAULT_OUT_DIR,
+                        default=DEFAULT_OUT_DIR,
+                        help=f"write both, named <model>_<timestamp> in this "
+                             f"directory (default: "
+                             f"{os.path.relpath(DEFAULT_OUT_DIR, ROOT_DIR)})")
+    parser.add_argument("--quiet", action="store_true",
+                        help="do not print the JSON document to stdout")
     args = parser.parse_args()
 
-    s = session()
+    s = make_session()
 
     if args.collection_id:
         collection_id = args.collection_id
         log(f"Fetching existing run {collection_id}")
     else:
-        spec = load_spec(args.model)
-        url = args.url or search_url(build_query(spec), 1, args.limit)
+        spec = load_model_spec(args.model)
+        url = args.url or search_page_url(model_query(spec), 1, args.limit)
         log(f"Model {args.model} ({spec.get('label', '?')}), "
             f"collector {args.collector}, max_page {args.max_page}")
-        collection_id = trigger(s, args.collector, url, args.max_page)
+        collection_id = trigger_run(s, args.collector, url, args.max_page)
         log(f"  triggered: {collection_id}")
 
-    raw = poll(s, collection_id, args.timeout)
-    rows = rows_of(raw)
+    raw = wait_for_rows(s, collection_id, args.timeout)
+    rows = to_rows(raw)
     filled = sum(1 for r in rows if r["car_number"])
     log(f"  {filled}/{len(rows)} rows with a car number")
 
-    write_output(args.model, collection_id, raw, rows)
+    meta = {
+        "collectionId": collection_id,
+        "collector": args.collector,
+        "maxPage": args.max_page,
+        "carNumbersFilled": filled,
+        # What the collector actually returned, untouched -- to_rows() keeps
+        # three fields, and a collector schema change must not silently lose
+        # the rest of a paid run.
+        "collectorRows": raw,
+    }
 
-    json.dump({"collection_id": collection_id, "count": len(rows), "rows": rows},
-              sys.stdout, ensure_ascii=False, indent=2)
-    sys.stdout.write("\n")
+    for path in results.save(TOOL, args.model, rows, meta, json_path=args.json_out,
+                             csv_path=args.csv_out, out_dir=args.out_dir):
+        log(f"  wrote {path}")
+
+    if not args.quiet:
+        json.dump(results.envelope(TOOL, args.model, rows,
+                                   {k: v for k, v in meta.items()
+                                    if k != "collectorRows"}),
+                  sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
     return 0
 
 

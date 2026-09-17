@@ -29,9 +29,9 @@ import sys
 from datetime import datetime
 from typing import List, Tuple
 
-from encar_stock_sync import HERE, connect, log
-
-MIGRATIONS_DIR = os.path.join(HERE, "migrations")
+from config import MIGRATIONS_DIR
+from db import connect
+from run_log import log
 
 TRACKING_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (

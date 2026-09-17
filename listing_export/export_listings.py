@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-crawl.py -- Encar listings by page, car number + model info only.
+export_listings.py -- Encar listings by page, car number + model info only.
 
-    python quick_crawl/crawl.py                    # 일반등록, page 1, 20 cars
-    python quick_crawl/crawl.py --pages 3
-    python quick_crawl/crawl.py --pages 2-5 --csv out.csv
-    python quick_crawl/crawl.py --pages all --workers 4 --delay 1
-    python quick_crawl/crawl.py --section premium --transport brightdata
+    python listing_export/export_listings.py                  # 일반등록, page 1, 20 cars
+    python listing_export/export_listings.py --pages 3
+    python listing_export/export_listings.py --pages 2-5 --csv out.csv
+    python listing_export/export_listings.py --pages all --out-dir
+    python listing_export/export_listings.py --section premium --source api
 
 What it does
 ------------
@@ -23,28 +23,34 @@ paid-placement tab. Both cover the same cars and differ only in ordering.
 Paging is 1-based, the way the site numbers it, and maps to Encar's offset.
 `--pages all` reads Count from the first page and walks the rest.
 
-Where the speed comes from
---------------------------
+Two sources, one result shape
+-----------------------------
+`--source page` (the default) renders the real search page in a local browser
+and reads its own XHR, then takes the car number from the detail page's HTML;
+`--source api` calls api.encar.com directly. Either way a run is one document:
+metadata, then one row per car (page, car_id, car_number, model_info). See
+results.py -- the same shape brightdata_collector and stock_pipeline write.
+
+Where the speed comes from (--source api)
+-----------------------------------------
 - `include=CATEGORY` on the detail call. The full payload is ~11 KB; with this
   it is ~0.9 KB and still carries vehicleNo and the whole category block. That
   is 12x less to transfer and parse, on the 20 requests that dominate the run.
 - The detail calls go out as one batch on a small thread pool over a pooled,
   cookie-less Session, so the TLS handshakes happen once and get reused.
-- No cookie warm-up. The old crawler opens encar.com first to look like a
-  browser; the API answers an anonymous request with no headers at all, so that
-  round trip buys nothing here.
-- No database, no browser on the normal path, nothing beyond `requests`.
+- No cookie warm-up. The API answers an anonymous request with no headers at
+  all, so opening encar.com first buys nothing here.
 
-Bright Data is the fallback, not the default: see transport.py. With
+Bright Data is the fallback, not the default: see http_transport.py. With
 `--transport auto` it is reached only after Encar throttles the run.
 
-Nothing is written anywhere: the result goes to stdout as JSON, or to --csv.
+Nothing is written unless asked for: the result goes to stdout as JSON, and to
+files with --json / --csv / --out-dir.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import os
@@ -58,14 +64,18 @@ except ImportError:  # dotenv is optional
     def load_dotenv(*_a, **_kw):  # type: ignore
         return False
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-load_dotenv(os.path.join(ROOT, ".env"))
+PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(PKG_DIR)
+load_dotenv(os.path.join(ROOT_DIR, ".env"))
 
-sys.path.insert(0, HERE)
-from transport import (  # noqa: E402
-    Req, Result, brightdata_available, make_client,
+sys.path.insert(0, PKG_DIR)
+import results  # noqa: E402
+from http_transport import (  # noqa: E402
+    Req, Result, brightdata_available, make_transport,
 )
+
+TOOL = "listing_export"
+DEFAULT_OUT_DIR = os.path.join(ROOT_DIR, "output", TOOL)
 
 # The two listing sections the site shows as tabs. 일반등록 is `general`;
 # `premium` is the paid-placement tab. Both cover the same set -- the Count is
@@ -75,7 +85,7 @@ SECTIONS = ("general", "premium")
 DEFAULT_SECTION = "general"
 
 DETAIL_URL = "https://api.encar.com/v1/readside/vehicle/{car_id}"
-MODELS_FILE = os.path.join(ROOT, "models.json")
+MODELS_FILE = os.path.join(ROOT_DIR, "models.json")
 
 DEFAULT_MODEL = "bmw_3series_g20"
 DEFAULT_LIMIT = 20
@@ -105,7 +115,7 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-def load_spec(key: str) -> Dict[str, str]:
+def load_model_spec(key: str) -> Dict[str, str]:
     """The model entry from the shared models.json in the project root."""
     try:
         with open(MODELS_FILE, encoding="utf-8") as fh:
@@ -121,7 +131,7 @@ def load_spec(key: str) -> Dict[str, str]:
     raise SystemExit(f"Unknown model {key!r}. models.json has: {known}")
 
 
-def build_query(spec: Dict[str, str]) -> str:
+def model_query(spec: Dict[str, str]) -> str:
     """Encar's search expression for one model.
 
     `Hidden.N` restricts it to listings currently advertised. `car_type` is the
@@ -134,7 +144,7 @@ def build_query(spec: Dict[str, str]) -> str:
     ).format(**{"car_type": "N", **spec})
 
 
-class Fetcher:
+class FailoverFetcher:
     """Runs batches, and moves the whole run to Bright Data when throttled.
 
     Escalation is one-way. Once Encar has rate limited this host, going back to
@@ -146,37 +156,37 @@ class Fetcher:
         self.mode = mode
         self.workers = workers
         self.escalated = mode == "brightdata"
-        self.client = make_client(
+        self.transport = make_transport(
             "brightdata" if mode == "brightdata" else "direct", workers
         )
 
     def _escalate(self) -> bool:
         if self.escalated or self.mode != "auto" or not brightdata_available():
             return False
-        self.client.close()
-        self.client = make_client("brightdata", self.workers)
+        self.transport.close()
+        self.transport = make_transport("brightdata", self.workers)
         self.escalated = True
         return True
 
     def run(self, reqs: Sequence[Req]) -> List[Result]:
         """One batch, re-running whatever Encar throttled until it lands."""
-        results = self.client.get_many(reqs)
+        batch = self.transport.get_many(reqs)
 
         for _ in range(MAX_THROTTLE_ROUNDS):
-            throttled = [i for i, r in enumerate(results) if r.throttled]
+            throttled = [i for i, r in enumerate(batch) if r.throttled]
             if not throttled:
                 break
 
             if self._escalate():
                 log(f"    throttled on {len(throttled)} request(s) "
-                    f"-> switching to {self.client.name}")
+                    f"-> switching to {self.transport.name}")
             elif self.escalated:
                 # The connection is held across batches for speed, so getting a
                 # different exit IP means asking for a new one explicitly.
-                reconnect = getattr(self.client, "reconnect", None)
+                reconnect = getattr(self.transport, "reconnect", None)
                 if reconnect is not None:
                     reconnect()
-                log(f"    {self.client.name}: {len(throttled)} request(s) got "
+                log(f"    {self.transport.name}: {len(throttled)} request(s) got "
                     f"407, retrying on a fresh exit IP")
                 time.sleep(BD_RETRY_PAUSE)
             else:
@@ -185,22 +195,22 @@ class Fetcher:
                 time.sleep(THROTTLE_BACKOFF)
 
             # Only the throttled ones are worth repeating; the rest landed.
-            retry = self.client.get_many([reqs[i] for i in throttled])
+            retry = self.transport.get_many([reqs[i] for i in throttled])
             for i, result in zip(throttled, retry):
-                results[i] = result
+                batch[i] = result
 
-        return results
+        return batch
 
     @property
     def name(self) -> str:
-        return self.client.name + (" (after throttle)" if self.escalated
-                                   and self.mode == "auto" else "")
+        return self.transport.name + (" (after throttle)" if self.escalated
+                                      and self.mode == "auto" else "")
 
     def close(self) -> None:
-        self.client.close()
+        self.transport.close()
 
 
-def model_info(category: Dict[str, Any], fallback: str) -> str:
+def detail_model_info(category: Dict[str, Any], fallback: str) -> str:
     """Readable model string, from the most specific parts available.
 
     The detail endpoint's category block carries the grade and grade detail the
@@ -216,7 +226,7 @@ def model_info(category: Dict[str, Any], fallback: str) -> str:
     return joined or fallback
 
 
-def listing_model(item: Dict[str, Any]) -> str:
+def listing_model_info(item: Dict[str, Any]) -> str:
     return " ".join(
         str(p) for p in (item.get("Manufacturer"), item.get("Model"), item.get("Badge"))
         if p
@@ -258,7 +268,18 @@ def listing_request(section: str, query: str, page: int, limit: int,
     })
 
 
-def throttle_hint(fetcher: "Fetcher", result: Result) -> str:
+def row(page: Any, car_id: Any, car_number: Optional[str],
+        model_info: str) -> Dict[str, Any]:
+    """The one row shape this tool emits -- see results.ROW_FIELDS."""
+    return {
+        "page": page,
+        "car_id": str(car_id),
+        "car_number": car_number,
+        "model_info": model_info,
+    }
+
+
+def throttle_hint(fetcher: "FailoverFetcher", result: Result) -> str:
     if result.throttled and fetcher.escalated:
         return (f"\nCloudFront threw 407 at every Bright Data exit IP this run "
                 f"tried ({MAX_THROTTLE_ROUNDS} of them). That is normal for the "
@@ -271,8 +292,8 @@ def throttle_hint(fetcher: "Fetcher", result: Result) -> str:
     return ""
 
 
-def collect_listings(fetcher: "Fetcher", section: str, query: str,
-                     pages: Optional[List[int]], limit: int) -> List[Dict[str, Any]]:
+def fetch_listing_pages(fetcher: "FailoverFetcher", section: str, query: str,
+                        pages: Optional[List[int]], limit: int) -> List[Dict[str, Any]]:
     """Listing items for the requested pages, in page order.
 
     The first page is fetched on its own because it is what reports `Count`,
@@ -304,10 +325,10 @@ def collect_listings(fetcher: "Fetcher", section: str, query: str,
 
     rest = [p for p in pages if p != first_page]
     if rest:
-        results = fetcher.run([
+        batch = fetcher.run([
             listing_request(section, query, p, limit, False) for p in rest
         ])
-        for page_no, result in zip(rest, results):
+        for page_no, result in zip(rest, batch):
             if not result.ok:
                 log(f"    ! page {page_no}: {result.error}")
                 continue
@@ -321,33 +342,31 @@ def collect_listings(fetcher: "Fetcher", section: str, query: str,
     return items
 
 
-def collect_details(fetcher: "Fetcher", items: List[Dict[str, Any]],
-                    delay: float) -> List[Dict[str, Any]]:
+def fetch_car_numbers(fetcher: "FailoverFetcher", items: List[Dict[str, Any]],
+                      delay: float) -> List[Dict[str, Any]]:
     """Car number and model info per listing, in chunks so progress is visible."""
     rows: List[Dict[str, Any]] = []
 
     for start in range(0, len(items), DETAIL_CHUNK):
         chunk = items[start:start + DETAIL_CHUNK]
-        results = fetcher.run([
+        batch = fetcher.run([
             (DETAIL_URL.format(car_id=it.get("Id")), {"include": "CATEGORY"})
             for it in chunk
         ])
 
-        for item, detail in zip(chunk, results):
-            fallback = listing_model(item)
+        for item, detail in zip(chunk, batch):
+            fallback = listing_model_info(item)
             data = detail.data or {}
             # A failed detail call leaves car_number None rather than dropping
             # the row, so the output always matches the pages that were asked
             # for -- a missing number is visible instead of silently absent.
             if not detail.ok and not detail.gone:
                 log(f"    ! detail {item.get('Id')}: {detail.error}")
-            rows.append({
-                "page": item.get("_page"),
-                "car_id": str(item.get("Id")),
-                "car_number": data.get("vehicleNo") or None,
-                "model_info": (model_info(data.get("category") or {}, fallback)
-                               if detail.ok else fallback),
-            })
+            rows.append(row(
+                item.get("_page"), item.get("Id"), data.get("vehicleNo") or None,
+                detail_model_info(data.get("category") or {}, fallback)
+                if detail.ok else fallback,
+            ))
 
         if len(items) > DETAIL_CHUNK:
             done = min(start + DETAIL_CHUNK, len(items))
@@ -358,22 +377,37 @@ def collect_details(fetcher: "Fetcher", items: List[Dict[str, Any]],
     return rows
 
 
-def crawl_pages(model_key: str, section: str, pages: Optional[List[int]],
-                limit: int, workers: int, with_detail: bool = True,
-                delay: float = 0.0, browser: str = "local") -> Dict[str, Any]:
-    """`--source page`: read the site the way a browser does. See page_source.py.
+def run_summary(model_key: str, spec: Dict[str, str], section: str, source: str,
+                transport: str, rows: List[Dict[str, Any]],
+                elapsed: float) -> Dict[str, Any]:
+    """The metadata half of the output document; results.save() adds the rows."""
+    return {
+        "model": model_key,
+        "label": spec.get("label"),
+        "section": section,
+        "source": source,
+        "transport": transport,
+        "pages": sorted({r["page"] for r in rows}),
+        "carNumbersFilled": sum(1 for r in rows if r["car_number"]),
+        "elapsedSeconds": round(elapsed, 2),
+    }
+
+
+def export_via_browser(model_key: str, section: str, pages: Optional[List[int]],
+                       limit: int, workers: int, with_detail: bool = True,
+                       delay: float = 0.0, browser: str = "local") -> Dict[str, Any]:
+    """`--source page`: read the site the way a browser does. See browser_source.py.
 
     The listing comes from the search page's own XHR and the car number from
-    the detail page's HTML, so no Encar API is called directly. This needs the
-    Scraping Browser -- there is nothing to render with otherwise.
+    the detail page's HTML, so no Encar API is called directly.
     """
-    from page_source import PageCrawler
-    from transport import brightdata_ws_url, brightdata_proxy_url
+    from browser_source import BrowserSource
+    from http_transport import brightdata_ws_url, brightdata_proxy_url
 
-    spec = load_spec(model_key)
-    action = build_query(spec)
+    spec = load_model_spec(model_key)
+    action = model_query(spec)
     proxy = brightdata_proxy_url()
-    crawler = PageCrawler(
+    source = BrowserSource(
         ws_url=brightdata_ws_url(), workers=workers, log=log,
         browser=browser, proxy_url=proxy,
     )
@@ -397,7 +431,7 @@ def crawl_pages(model_key: str, section: str, pages: Optional[List[int]],
                 continue
             done.add(page_no)
 
-            data = crawler.listing(action, page_no, limit, section)
+            data = source.listing_page(action, page_no, limit, section)
             if data is None:
                 log(f"    ! page {page_no}: blocked, no data")
                 continue
@@ -413,17 +447,12 @@ def crawl_pages(model_key: str, section: str, pages: Optional[List[int]],
             log(f"  page {page_no}: {len(items)} cars")
 
             if with_detail:
-                found = crawler.details(items)
+                found = source.car_numbers(items)
             else:
-                found = [(None, listing_model(it)) for it in items]
+                found = [(None, listing_model_info(it)) for it in items]
 
             for item, (car_number, info) in zip(items, found):
-                rows.append({
-                    "page": page_no,
-                    "car_id": str(item.get("Id")),
-                    "car_number": car_number,
-                    "model_info": info,
-                })
+                rows.append(row(page_no, item.get("Id"), car_number, info))
 
             if delay and queue:
                 time.sleep(delay)
@@ -432,72 +461,42 @@ def crawl_pages(model_key: str, section: str, pages: Optional[List[int]],
         filled = sum(1 for r in rows if r["car_number"])
         log(f"  {filled}/{len(rows)} car numbers in {elapsed:.2f}s (page source)")
 
-        return {
-            "model": model_key,
-            "label": spec.get("label"),
-            "section": section,
-            "source": "page",
-            "pages": sorted({r["page"] for r in rows}),
-            "count": len(rows),
-            "transport": f"{browser}-browser",
-            "elapsed_seconds": round(elapsed, 2),
-            "rows": rows,
-        }
+        return {"rows": rows, **run_summary(model_key, spec, section, "page",
+                                            f"{browser}-browser", rows, elapsed)}
     finally:
-        crawler.close()
+        source.close()
 
 
-def crawl(model_key: str, section: str, pages: Optional[List[int]], limit: int,
-          workers: int, mode: str, with_detail: bool = True,
-          delay: float = 0.0) -> Dict[str, Any]:
-    spec = load_spec(model_key)
-    fetcher = Fetcher(mode, workers)
+def export_via_api(model_key: str, section: str, pages: Optional[List[int]],
+                   limit: int, workers: int, mode: str, with_detail: bool = True,
+                   delay: float = 0.0) -> Dict[str, Any]:
+    """`--source api`: call api.encar.com directly, with Bright Data as fallback."""
+    spec = load_model_spec(model_key)
+    fetcher = FailoverFetcher(mode, workers)
     started = time.time()
 
     try:
         log(f"Model {model_key} ({spec.get('label', '?')}), "
             f"section {section}, transport {fetcher.name}")
 
-        items = collect_listings(fetcher, section, build_query(spec), pages, limit)
+        items = fetch_listing_pages(fetcher, section, model_query(spec), pages, limit)
 
         if with_detail:
-            rows = collect_details(fetcher, items, delay)
+            rows = fetch_car_numbers(fetcher, items, delay)
         else:
             # Without the detail pass there is no car number to be had; the
             # listing carries the model only.
-            rows = [{
-                "page": it.get("_page"),
-                "car_id": str(it.get("Id")),
-                "car_number": None,
-                "model_info": listing_model(it),
-            } for it in items]
+            rows = [row(it.get("_page"), it.get("Id"), None, listing_model_info(it))
+                    for it in items]
 
         elapsed = time.time() - started
         filled = sum(1 for r in rows if r["car_number"])
         log(f"  {filled}/{len(rows)} car numbers in {elapsed:.2f}s ({fetcher.name})")
 
-        return {
-            "model": model_key,
-            "label": spec.get("label"),
-            "section": section,
-            "source": "api",
-            "pages": sorted({r["page"] for r in rows}),
-            "count": len(rows),
-            "transport": fetcher.name,
-            "elapsed_seconds": round(elapsed, 2),
-            "rows": rows,
-        }
+        return {"rows": rows, **run_summary(model_key, spec, section, "api",
+                                            fetcher.name, rows, elapsed)}
     finally:
         fetcher.close()
-
-
-def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
-    # utf-8-sig so Excel opens the Korean plates and model names correctly.
-    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
-        writer = csv.DictWriter(
-            fh, fieldnames=["page", "car_id", "car_number", "model_info"])
-        writer.writeheader()
-        writer.writerows(rows)
 
 
 def main() -> int:
@@ -521,8 +520,8 @@ def main() -> int:
                         help="skip the per-car requests -- fast, but no car number")
     parser.add_argument("--source", choices=("page", "api"), default="page",
                         help="page (default) renders the real search page in the "
-                             "Scraping Browser and reads its own XHR, then takes "
-                             "the car number from the detail page HTML; api calls "
+                             "browser and reads its own XHR, then takes the car "
+                             "number from the detail page HTML; api calls "
                              "api.encar.com directly")
     parser.add_argument("--browser", choices=("local", "brightdata"),
                         default="local",
@@ -531,35 +530,45 @@ def main() -> int:
                              "cannot load the site's JavaScript (see README)")
     parser.add_argument("--transport", choices=("auto", "direct", "brightdata"),
                         default="brightdata",
-                        help="brightdata (default) routes every request through "
-                             "Bright Data; direct goes straight out; auto goes "
-                             "direct and fails over when throttled")
-    parser.add_argument("--csv", help="also write the rows to this CSV file")
+                        help="--source api only: brightdata (default) routes every "
+                             "request through Bright Data; direct goes straight "
+                             "out; auto goes direct and fails over when throttled")
+    parser.add_argument("--json", dest="json_out", help="write the run to this JSON file")
+    parser.add_argument("--csv", dest="csv_out", help="write the rows to this CSV file")
+    parser.add_argument("--out-dir", nargs="?", const=DEFAULT_OUT_DIR,
+                        help=f"write both, named <model>_<timestamp> in this "
+                             f"directory (default: "
+                             f"{os.path.relpath(DEFAULT_OUT_DIR, ROOT_DIR)})")
+    parser.add_argument("--quiet", action="store_true",
+                        help="do not print the JSON document to stdout")
     args = parser.parse_args()
 
     pages = parse_pages(args.pages)
 
-    if args.transport != "direct" and not brightdata_available():
+    if args.source == "api" and args.transport != "direct" and not brightdata_available():
         log("  note: no Bright Data credentials in .env, direct only")
 
     try:
         if args.source == "page":
-            result = crawl_pages(args.model, args.section, pages, args.limit,
-                                 args.workers, with_detail=not args.no_detail,
-                                 delay=args.delay, browser=args.browser)
+            run = export_via_browser(args.model, args.section, pages, args.limit,
+                                     args.workers, with_detail=not args.no_detail,
+                                     delay=args.delay, browser=args.browser)
         else:
-            result = crawl(args.model, args.section, pages, args.limit,
-                           args.workers, args.transport,
-                           with_detail=not args.no_detail, delay=args.delay)
+            run = export_via_api(args.model, args.section, pages, args.limit,
+                                 args.workers, args.transport,
+                                 with_detail=not args.no_detail, delay=args.delay)
     except RuntimeError as exc:  # transport misconfiguration
         raise SystemExit(str(exc))
 
-    if args.csv:
-        write_csv(args.csv, result["rows"])
-        log(f"  wrote {args.csv}")
+    rows = run.pop("rows")
+    for path in results.save(TOOL, args.model, rows, run, json_path=args.json_out,
+                             csv_path=args.csv_out, out_dir=args.out_dir):
+        log(f"  wrote {path}")
 
-    json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
-    sys.stdout.write("\n")
+    if not args.quiet:
+        json.dump(results.envelope(TOOL, args.model, rows, run), sys.stdout,
+                  ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
     return 0
 
 

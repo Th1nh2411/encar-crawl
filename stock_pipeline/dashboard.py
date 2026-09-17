@@ -1,12 +1,12 @@
 """
-app.py — Local web UI over the Encar crawl database.
+dashboard.py — Local web UI over the Encar crawl database.
 
 An MVP dashboard, not a service: it binds to localhost, has no auth, and runs
 the crawler as a subprocess of itself. Do not expose it.
 
     pip install flask pymysql python-dotenv
     python migrate.py
-    python app.py            # http://127.0.0.1:5050  (UI_PORT to change)
+    python dashboard.py            # http://127.0.0.1:5050  (UI_PORT to change)
 
 Pages
 -----
@@ -15,7 +15,7 @@ Pages
     /listings    raw Encar ads (vehicles) — several per car, price per dealer
     /runs        crawl history from crawl_batches, plus the tail of the log
 
-The Crawl button spawns `encar_list_init.py`. Only one crawl runs at a time:
+The Crawl button spawns `crawl_listings.py`. Only one crawl runs at a time:
 this process refuses to spawn a second, and the crawler itself takes a MySQL
 advisory lock, so a run started from a terminal blocks the button too.
 """
@@ -29,11 +29,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, render_template, request
 
-from encar_stock_sync import HERE, PKG_DIR, connect, load_specs
+from config import LOG_PATH, MODELS_FILE, PKG_DIR, ROOT_DIR
+from db import connect
+from models import load_specs
 
 app = Flask(__name__)
 
-LOG_PATH = os.path.join(HERE, "logs", "encar.log")
 PAGE_SIZE = 50
 
 # ── Crawl process state ───────────────────────────────────────────────────────
@@ -75,16 +76,16 @@ def start_crawl(models: List[str]) -> Tuple[bool, str]:
         if proc is not None and proc.poll() is None:
             return False, "A crawl is already running."
 
-        # The crawler sits next to this file in stock_sync/; HERE is the project
-        # root, which is where it should run so relative paths resolve as before.
-        cmd = [sys.executable, os.path.join(PKG_DIR, "encar_list_init.py"),
+        # The crawler sits next to this file in stock_pipeline/; it runs from the
+        # project root so relative paths resolve the same way a manual run does.
+        cmd = [sys.executable, os.path.join(PKG_DIR, "crawl_listings.py"),
                "--log-file", LOG_PATH]
         for key in models:
             cmd += ["--model", key]
 
         try:
             proc = subprocess.Popen(
-                cmd, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cmd, cwd=ROOT_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
             )
         except OSError as exc:
@@ -117,7 +118,7 @@ def scalar(sql: str, params: Tuple = ()) -> Any:
 def model_options() -> List[Dict[str, str]]:
     try:
         return [{"key": s["key"], "label": s["label"]}
-                for s in load_specs(os.path.join(HERE, "models.json"), [])]
+                for s in load_specs(MODELS_FILE)]
     except SystemExit:
         return []
 

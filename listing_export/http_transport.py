@@ -1,5 +1,5 @@
 """
-transport.py -- How quick_crawl reaches Encar.
+http_transport.py -- How listing_export reaches Encar.
 
 Three backends behind one `get_many(requests)` batch call:
 
@@ -108,7 +108,7 @@ class _BlockCookies:
         return False
 
 
-class DirectClient:
+class DirectTransport:
     """Pooled, cookie-less Session over a thread pool. Optionally proxied."""
 
     name = "direct"
@@ -170,7 +170,7 @@ class DirectClient:
         self.session.close()
 
 
-class BrightDataProxyClient(DirectClient):
+class BrightDataProxyTransport(DirectTransport):
     name = "bd-proxy"
 
     def __init__(self, proxy_url: str, workers: int = 8, timeout: float = 30.0):
@@ -180,7 +180,7 @@ class BrightDataProxyClient(DirectClient):
 
 # ── Bright Data Scraping Browser ──────────────────────────────────────────────
 
-class BrightDataBrowserClient:
+class BrightDataBrowserTransport:
     """Fetches through Bright Data's Scraping Browser over CDP.
 
     The browser is only a transport here: these are JSON endpoints, so nothing
@@ -348,18 +348,18 @@ def brightdata_available() -> bool:
     return brightdata_proxy_url() is not None or brightdata_ws_url() is not None
 
 
-def make_client(kind: str, workers: int = 8):
+def make_transport(kind: str, workers: int = 8):
     """`kind` is one of direct / brightdata."""
     if kind == "direct":
-        return DirectClient(workers=workers)
+        return DirectTransport(workers=workers)
 
     if kind == "brightdata":
         proxy = brightdata_proxy_url()
         if proxy:
-            return BrightDataProxyClient(proxy, workers=workers)
+            return BrightDataProxyTransport(proxy, workers=workers)
         ws = brightdata_ws_url()
         if ws:
-            return BrightDataBrowserClient(ws, workers=workers)
+            return BrightDataBrowserTransport(ws, workers=workers)
         raise RuntimeError(
             "Bright Data is not configured: set BRIGHTDATA_WS (Scraping "
             "Browser) or BRIGHTDATA_PROXY_URL (proxy zone) in .env."

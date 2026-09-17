@@ -1,4 +1,7 @@
-const links = $('a[href*="carid="], a[href*="/cars/detail/"]').toArray();
+// Chỉ lấy xe trong vùng 일반등록 (#sr_normal), bỏ qua block quảng cáo/đề xuất
+const links = $(
+    '#sr_normal a[href*="carid="], #sr_normal a[href*="/cars/detail/"]',
+).toArray();
 
 const ids = new Set();
 

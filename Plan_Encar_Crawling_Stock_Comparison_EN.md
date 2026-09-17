@@ -27,7 +27,7 @@ Three options followed from this:
 | Option | Requests per model | Note |
 |---|---|---|
 | A — listing + detail per car | ~1,187 | Restores the vehicle number, but reintroduces the detail-page cost the plan set out to remove |
-| B — one keyword search per plate in `stock` | 1 per stock vehicle | The existing `status_crawl.py` approach |
+| B — one keyword search per plate in `stock` | 1 per stock vehicle | The existing `stock_pipeline/check_plate_status.py` approach |
 | **C — listing only, match on Encar `carId`** | **~6** | **Chosen.** Requires `stock` to store the Encar listing id — confirmed it does |
 
 **Decision: option C.** The matching key is the Encar listing id (`car_id`), not the vehicle number.
@@ -191,9 +191,9 @@ The old approach was slow because it visited **individual detail pages** to pull
 
 | # | Deliverable | Status | Where |
 |---|---|---|---|
-| 1 | `crawled_vehicles` + `crawl_batches` migrations | Done | `status_crawl/migrations/001_crawl_tables.sql` |
-| 2 | Encar listing crawler (direct API, no browser) | Done, tested live | `status_crawl/encar_stock_sync.py` |
-| 3 | Per-model crawl config + `stock` scoping filter | Done — **`stock_filter` values are placeholders, need the real `stock` columns** | `status_crawl/models.json` |
+| 1 | `crawled_vehicles` + `crawl_batches` migrations | Done | `migrations/001_crawl_tables.sql` |
+| 2 | Encar listing crawler (direct API, no browser) | Done, tested live | `stock_pipeline/sync_sold.py` |
+| 3 | Per-model crawl config + `stock` scoping filter | Done — **`stock_filter` values are placeholders, need the real `stock` columns** | `models.json` |
 | 4 | Comparison logic `stock` vs `crawled_vehicles` | Done, SQL verified; not yet run against a real DB | `compare_and_mark()` |
 | 5 | Sold-status update + run logging | Done — every run writes a `crawl_batches` row with its metrics and outcome | `crawl_batches` |
 | 6 | Completion-rate tracking + threshold gate (§4) | Done, gate matrix tested | `evaluate()` |
@@ -205,16 +205,16 @@ The old approach was slow because it visited **individual detail pages** to pull
 pip install requests pymysql python-dotenv
 
 # Crawl only, no DB — smoke test
-python status_crawl/encar_stock_sync.py --no-db --json output/snapshot.json
+python stock_pipeline/sync_sold.py --no-db --out-dir
 
 # Full run, but roll back — reports how many rows WOULD be marked SOLD
-python status_crawl/encar_stock_sync.py --dry-run
+python stock_pipeline/sync_sold.py --dry-run
 
 # Full run
-python status_crawl/encar_stock_sync.py
+python stock_pipeline/sync_sold.py
 
 # One model
-python status_crawl/encar_stock_sync.py --model bmw_3series_g20
+python stock_pipeline/sync_sold.py --model bmw_3series_g20
 ```
 
 ### Before the first real run

@@ -1,5 +1,5 @@
 """
-page_source.py -- Crawl Encar the way a browser does, not by calling the API.
+browser_source.py -- Read Encar the way a browser does, not by calling the API.
 
 Two steps, both through the Bright Data Scraping Browser:
 
@@ -71,7 +71,7 @@ def decode(raw: bytes) -> str:
     return raw.decode("utf-8", "replace")
 
 
-def search_url(action: str, page: int, limit: int,
+def search_page_url(action: str, page: int, limit: int,
                sort: str = "ModifiedDate") -> str:
     """The site's own URL for one page of results.
 
@@ -116,7 +116,7 @@ def listing_score(url: str, rows: int, page: int, limit: int,
     return score
 
 
-def parse_detail(html: str, fallback: str) -> Tuple[Optional[str], str]:
+def parse_detail_page(html: str, fallback: str) -> Tuple[Optional[str], str]:
     """Car number and model info out of a detail page's embedded JSON."""
     match = RE_VEHICLE_NO.search(html)
     car_number = match.group(1) if match else None
@@ -130,7 +130,7 @@ def parse_detail(html: str, fallback: str) -> Tuple[Optional[str], str]:
     return car_number, (" ".join(parts) or fallback)
 
 
-class PageCrawler:
+class BrowserSource:
     """Drives one Scraping Browser session for both steps.
 
     The browser, the Playwright driver and the event loop are created once and
@@ -212,12 +212,12 @@ class PageCrawler:
 
     # ── listing ───────────────────────────────────────────────────────────
 
-    def listing(self, action: str, page: int, limit: int, section: Optional[str],
+    def listing_page(self, action: str, page: int, limit: int, section: Optional[str],
                 attempts: int = 3) -> Optional[Dict[str, Any]]:
         """The listing payload for one page, or None if every attempt was blocked."""
         for attempt in range(attempts):
             data = self._get_loop().run_until_complete(
-                self._listing_once(action, page, limit, section)
+                self._listing_page_once(action, page, limit, section)
             )
             if data is not None:
                 return data
@@ -228,7 +228,7 @@ class PageCrawler:
                 time.sleep(2.0)
         return None
 
-    async def _listing_once(self, action: str, page: int, limit: int,
+    async def _listing_page_once(self, action: str, page: int, limit: int,
                             section: Optional[str]) -> Optional[Dict[str, Any]]:
         try:
             ctx = await self._ctx()
@@ -265,7 +265,7 @@ class PageCrawler:
             # or networkidle is pointless here: the page keeps analytics and
             # polling traffic alive, so neither ever settles, and the XHR we
             # want arrives long before they would.
-            await pg.goto(search_url(action, page, limit), timeout=self.timeout * 1000,
+            await pg.goto(search_page_url(action, page, limit), timeout=self.timeout * 1000,
                           wait_until="commit")
         except Exception as exc:
             self.log(f"    page {page}: navigation failed: {str(exc)[:80]}")
@@ -287,7 +287,7 @@ class PageCrawler:
 
     # ── detail ────────────────────────────────────────────────────────────
 
-    def details(self, items: List[Dict[str, Any]]) -> List[Tuple[Optional[str], str]]:
+    def car_numbers(self, items: List[Dict[str, Any]]) -> List[Tuple[Optional[str], str]]:
         """Car number and model info per listing, from the detail pages' HTML.
 
         This is plain HTTP on a thread pool, not the browser: the detail page is
@@ -306,7 +306,7 @@ class PageCrawler:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(self.workers, len(subset))
             ) as pool:
-                return list(pool.map(lambda it: self._one_detail(session, it), subset))
+                return list(pool.map(lambda it: self._car_number(session, it), subset))
 
         had_proxy = bool(self.proxy_url)
         results = run(items)
@@ -349,7 +349,7 @@ class PageCrawler:
             self._session = session
         return self._session
 
-    def _one_detail(self, session, item: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    def _car_number(self, session, item: Dict[str, Any]) -> Tuple[Optional[str], str]:
         fallback = " ".join(
             str(p) for p in (item.get("Manufacturer"), item.get("Model"),
                              item.get("Badge")) if p
@@ -361,7 +361,7 @@ class PageCrawler:
                 resp = session.get(url, timeout=self.timeout)
             if resp.status_code != 200:
                 return None, fallback
-            return parse_detail(decode(resp.content), fallback)
+            return parse_detail_page(decode(resp.content), fallback)
         except Exception:
             return None, fallback
 

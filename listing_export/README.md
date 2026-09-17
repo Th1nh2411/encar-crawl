@@ -1,4 +1,4 @@
-# quick_crawl
+# listing_export
 
 First page of one Encar model, two fields per car: **car number** and **model info**.
 
@@ -8,11 +8,11 @@ Standalone — no database, no migrations, no browser on the normal path. It sha
 ## Run
 
 ```bash
-python quick_crawl/crawl.py                     # 일반등록, page 1, 20 cars
-python quick_crawl/crawl.py --pages 3
-python quick_crawl/crawl.py --pages 2-5 --csv out.csv
-python quick_crawl/crawl.py --pages all --workers 4 --delay 1
-python quick_crawl/crawl.py --source api --transport direct
+python listing_export/export_listings.py                     # 일반등록, page 1, 20 cars
+python listing_export/export_listings.py --pages 3
+python listing_export/export_listings.py --pages 2-5 --csv out.csv
+python listing_export/export_listings.py --pages all --out-dir
+python listing_export/export_listings.py --source api --transport direct
 ```
 
 `--pages` takes `1`, `2-5` or `all`, 1-based like the site. `--section general`
@@ -108,7 +108,7 @@ Measured, 20 rows: **~1.3s** direct.
 | `include=CATEGORY` on detail | 11 KB → 0.9 KB per response, **12× less** to transfer and parse, on the 20 requests that dominate the run |
 | One batch on an 8-thread pool | 20 detail calls overlap instead of queueing |
 | Pooled, cookie-less Session | TLS handshakes reused; no `Set-Cookie` parsing, and no cookie jar to make sharing threads unsafe |
-| No cookie warm-up | `stock_sync` opens `encar.com` first to look like a browser. The API answers a request with *no headers at all*, so that round trip buys nothing |
+| No cookie warm-up | `stock_pipeline` opens `encar.com` first to look like a browser. The API answers a request with *no headers at all*, so that round trip buys nothing |
 | `trust_env = False` | macOS system proxy settings otherwise leak in and answer every call with 407 |
 
 ## Transports
@@ -161,7 +161,7 @@ It boots a real Chrome to read a JSON document. Encar's API needs no rendering
 and throws no captcha, so everything the browser provides is waste — including
 that 1s handshake. Either of these would fit better:
 
-- **A residential proxy zone.** `DirectClient` already takes `proxies`, so
+- **A residential proxy zone.** `DirectTransport` already takes `proxies`, so
   setting `BRIGHTDATA_PROXY_URL` uses it with no browser and no Playwright at
   all. Residential IPs are also what the search endpoint's 407 is asking for.
 - **Web Unlocker**, one HTTP call per URL against `api.brightdata.com`.

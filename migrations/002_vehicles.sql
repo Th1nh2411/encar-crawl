@@ -1,4 +1,4 @@
--- Master list of vehicles seen on Encar, seeded by encar_list_init.py.
+-- Master list of vehicles seen on Encar, seeded by stock_pipeline/crawl_listings.py.
 --
 -- One row per Encar listing id. `vehicle_no` is NOT unique on purpose: the same
 -- physical car is often advertised by several dealers at once (Encar flags

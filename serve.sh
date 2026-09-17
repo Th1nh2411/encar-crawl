@@ -17,10 +17,11 @@
 # a secret. Ctrl-C stops both processes and the public URL dies with them.
 
 set -euo pipefail
-# app.py lives in stock_sync/ together with its templates/, and gunicorn
-# resolves "app:app" against the working directory. The app itself anchors its
-# data paths on the project root, so it does not care where it is started from.
-cd "$(dirname "$0")/stock_sync"
+# dashboard.py lives in stock_pipeline/ together with its templates/, and
+# gunicorn resolves "dashboard:app" against the working directory. The app
+# anchors its data paths on the project root, so it does not care where it is
+# started from.
+cd "$(dirname "$0")/stock_pipeline"
 
 PORT="${UI_PORT:-5050}"
 WORKERS=1
@@ -46,7 +47,7 @@ python3 -m gunicorn \
     --timeout "${TIMEOUT}" \
     --access-logfile - \
     --error-logfile - \
-    app:app &
+    dashboard:app &
 GUNICORN_PID=$!
 
 cleanup() {
