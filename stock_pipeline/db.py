@@ -78,6 +78,32 @@ def previous_ok_count(cur, model_key: str) -> Optional[int]:
     return int(row[0]) if row else None
 
 
+def known_details(cur, model_key: str) -> Dict[str, Dict[str, Any]]:
+    """Detail fields already stored for this model, keyed by car_id.
+
+    The vehicle number costs one detail request per car and never changes once
+    known, so a car already carrying one in `vehicles` does not need asking
+    about again. On a daily crawl that is the difference between a request for
+    every car every day and a request for the handful newly listed — and Encar
+    rate limits on request count, so it is also what keeps the crawl under the
+    limit as the number of models grows.
+
+    Only the fields that come from the detail payload and do not change:
+    mileage and price move, and they come from the listing anyway.
+    """
+    cur.execute(
+        "SELECT car_id, vehicle_no, model_info, manufacturer, model_group, "
+        "model_name, grade_name, form_year, `year_month`, fuel_name, "
+        "transmission, color_name FROM vehicles "
+        "WHERE model_key = %s AND vehicle_no IS NOT NULL",
+        (model_key,),
+    )
+    fields = ("vehicle_no", "model_info", "manufacturer", "model_group",
+              "model_name", "grade_name", "form_year", "year_month",
+              "fuel_name", "transmission", "color_name")
+    return {str(row[0]): dict(zip(fields, row[1:])) for row in cur.fetchall()}
+
+
 def open_batch(cur, model_key: str, started_at: datetime) -> int:
     cur.execute(
         "INSERT INTO crawl_batches (model_key, started_at, status) "

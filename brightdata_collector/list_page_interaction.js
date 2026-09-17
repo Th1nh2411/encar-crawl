@@ -2,7 +2,9 @@
 const base_url = input.url || 'https://www.encar.com/fc/fc_carsearchlist.do?carType=for#!%7B%22action%22%3A%22(And.Hidden.N._.(C.CarType.N._.(C.Manufacturer.BMW._.(C.ModelGroup.3%EC%8B%9C%EB%A6%AC%EC%A6%88._.Model.3%EC%8B%9C%EB%A6%AC%EC%A6%88%20(G20_).))))%22%2C%22toggle%22%3A%7B%7D%2C%22layer%22%3A%22%22%2C%22sort%22%3A%22ModifiedDate%22%2C%22page%22%3A1%2C%22limit%22%3A20%2C%22searchKey%22%3A%22%22%2C%22loginCheck%22%3Afalse%7D';
 
 // Điều hướng tới trang mục tiêu
-navigate(base_url, {wait_until: 'networkidle'});
+// domcontentloaded + chờ đúng selector cần: 'networkidle' trên Encar gần như
+// luôn chạy hết timeout vì tracker/ads giữ kết nối mở.
+navigate(base_url, {wait_until: 'domcontentloaded'});
 
 // 2. Xử lý phân trang tự động (chỉ chạy ở lần chạy gốc đầu tiên)
 if (!input.is_rerun) {
@@ -20,19 +22,11 @@ if (!input.is_rerun) {
     }
 }
 
-// 3. Đợi vùng chứa danh sách xe 일반등록 load xong
-const car_list_container = '#sr_normal';
+// 3. Chỉ chờ một lần: link chi tiết trong vùng 일반등록 (#sr_normal).
+// Link xuất hiện đồng nghĩa container đã render, nên không cần wait 2 lần và
+// không cần scroll_to (chỉ lấy href, không cần ảnh lazy-load).
 try {
-    wait(car_list_container, {timeout: 15000});
-    scroll_to(car_list_container);
-} catch (e) {
-    console.log("Không tìm thấy vùng chứa danh sách xe, trang có thể đang tải chậm hoặc hết dữ liệu.");
-}
-
-// 4. Đợi các đường dẫn chi tiết xe xuất hiện
-const car_link_selector = '#sr_normal tr td.inf a[href*="dc_cardetailview"]';
-try {
-    wait(car_link_selector, {timeout: 10000});
+    wait('#sr_normal tr td.inf a[href*="dc_cardetailview"]', {timeout: 15000});
 } catch (e) {
     console.log("Không tìm thấy link chi tiết xe nào trên trang này.");
 }

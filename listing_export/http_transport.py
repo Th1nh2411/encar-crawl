@@ -26,6 +26,7 @@ handing it all 20 detail requests at once means paying it once.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, quote, urlencode
@@ -176,6 +177,153 @@ class BrightDataProxyTransport(DirectTransport):
     def __init__(self, proxy_url: str, workers: int = 8, timeout: float = 30.0):
         super().__init__(workers=workers, timeout=timeout,
                          proxies={"http": proxy_url, "https": proxy_url})
+
+
+# ── ScrapingBee ───────────────────────────────────────────────────────────────
+
+SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
+
+# ScrapingBee's own failures, not the target's: 500 is its transient error and
+# 429 is the plan's concurrency cap. Both clear on an immediate retry.
+SB_RETRY_STATUSES = (429, 500, 502, 503)
+SB_RETRIES = 2
+SB_RETRY_PAUSE = 1.0
+
+# Measured against this account, 20 detail calls at a time:
+#
+#   workers 3   24/24 ok
+#   workers 4   18/20, two 500s
+#   workers 6   18/20, two 500s
+#   workers 8   11/24, twelve 429s  <- the plan's concurrency cap
+#
+# So the cap is ScrapingBee's, not Encar's, and the default is set below it
+# rather than inheriting --workers, which is tuned for going direct.
+SB_WORKERS = 3
+
+
+class ScrapingBeeTransport:
+    """Fetches through ScrapingBee's API, which takes the target URL as a param.
+
+    Not a proxy: the request goes to ScrapingBee and the target comes back as
+    the body, so this cannot subclass DirectTransport the way the Bright Data
+    proxy does -- the URL and the params have to be rewritten per request.
+
+    `render_js=false` matters more than anything else here. These are JSON
+    endpoints, so rendering buys nothing and costs 5x the credits. Cost is per
+    request and depends on the proxy tier:
+
+        classic         1 credit   -- datacenter IPs, which Encar answers 407
+                                      to about two attempts in three
+        premium/stealth 25-75      -- residential, which is what gets through
+
+    So `premium` is not a nicety, it is the reason to use this at all; it is on
+    by default and SCRAPINGBEE_PREMIUM=0 turns it off for a cheap experiment.
+    Paired with the plate cache this stays small: a repeat run over 16000 cars
+    is ~80 listing calls, not 16800.
+    """
+
+    name = "scrapingbee"
+
+    def __init__(self, api_key: str, workers: int = 8, timeout: float = 60.0,
+                 premium: bool = True):
+        self.api_key = api_key
+        self.workers = workers
+        self.timeout = timeout
+        self.premium = premium
+        # Set once the account says it is out of calls for the month. Every
+        # request after that gets the same answer, so there is no point making
+        # them: a 200-car page spent 199 calls learning what the first one
+        # already said.
+        self.exhausted: Optional[str] = None
+
+        session = requests.Session()
+        session.trust_env = False
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=workers, pool_maxsize=workers, max_retries=0
+        )
+        session.mount("https://", adapter)
+        self.session = session
+
+    def _params(self, url: str, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "api_key": self.api_key,
+            # The target URL arrives as a parameter, so its own query string
+            # has to be part of it -- and requests must not re-encode it.
+            "url": full_url(url, params),
+            "render_js": "false",
+        }
+        if self.premium:
+            out["premium_proxy"] = "true"
+            # Encar is Korean and geoblocks some paths; asking for a Korean
+            # exit also makes the traffic look like the site's own audience.
+            out["country_code"] = "kr"
+        return out
+
+    def _one(self, req: Req) -> Result:
+        url, params = req
+        if self.exhausted:
+            return Result(status=401, error=self.exhausted)
+
+        result = Result(error="not attempted")
+
+        # 500 and 429 here are ScrapingBee's, not Encar's: 500 is its own
+        # transient failure ("you will not be charged for this request") and
+        # 429 is the plan's concurrency cap. Measured over 20 calls, both show
+        # up at 4+ workers and neither survives a retry a moment later -- so
+        # they are worth repeating immediately, unlike an Encar throttle, which
+        # needs minutes. A failed 500 costs nothing, so retrying is free.
+        for attempt in range(SB_RETRIES + 1):
+            result = self._attempt(url, params)
+            if result.ok or result.status not in SB_RETRY_STATUSES:
+                return result
+            if attempt < SB_RETRIES:
+                time.sleep(SB_RETRY_PAUSE * (attempt + 1))
+        return result
+
+    def _attempt(self, url: str, params: Optional[Dict[str, Any]]) -> Result:
+        try:
+            resp = self.session.get(SCRAPINGBEE_URL, params=self._params(url, params),
+                                    timeout=self.timeout)
+        except requests.RequestException as exc:
+            return Result(error=f"{type(exc).__name__}: {exc}")
+
+        if resp.status_code == 200:
+            try:
+                return Result(data=resp.json() if resp.content else None, status=200)
+            except ValueError as exc:
+                # ScrapingBee answers 200 with an HTML error page in some
+                # failure modes, so a body that will not parse is a failure
+                # even though the status says otherwise.
+                return Result(status=200, error=f"bad JSON: {exc}")
+
+        # ScrapingBee reports its own problems (402 out of credits, 401 bad
+        # key) with the same statuses the target uses, so its message is
+        # carried through rather than reduced to a number.
+        detail = (resp.text or "")[:200].replace("\n", " ")
+        error = f"HTTP {resp.status_code} {detail}".strip()
+
+        # "Monthly API calls limit reached" is about the account, not this
+        # request: every call for the rest of the month gets it. Remember it so
+        # the batch stops instead of asking 199 more times.
+        if resp.status_code == 401 and "limit reached" in detail:
+            self.exhausted = error
+
+        return Result(status=resp.status_code, error=error)
+
+    def get_many(self, reqs: Sequence[Req]) -> List[Result]:
+        if not reqs:
+            return []
+        if len(reqs) == 1:
+            return [self._one(reqs[0])]
+
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(self.workers, len(reqs))
+        ) as pool:
+            return list(pool.map(self._one, reqs))
+
+    def close(self) -> None:
+        self.session.close()
 
 
 # ── Bright Data Scraping Browser ──────────────────────────────────────────────
@@ -348,10 +496,27 @@ def brightdata_available() -> bool:
     return brightdata_proxy_url() is not None or brightdata_ws_url() is not None
 
 
+def scrapingbee_key() -> Optional[str]:
+    return (os.getenv("SCRAPINGBEE_KEY") or "").strip() or None
+
+
+def scrapingbee_available() -> bool:
+    return scrapingbee_key() is not None
+
+
 def make_transport(kind: str, workers: int = 8):
-    """`kind` is one of direct / brightdata."""
+    """`kind` is one of direct / brightdata / scrapingbee."""
     if kind == "direct":
         return DirectTransport(workers=workers)
+
+    if kind == "scrapingbee":
+        key = scrapingbee_key()
+        if not key:
+            raise RuntimeError("SCRAPINGBEE_KEY is not set in .env")
+        return ScrapingBeeTransport(
+            key, workers=min(workers, SB_WORKERS),
+            premium=os.getenv("SCRAPINGBEE_PREMIUM", "1") != "0",
+        )
 
     if kind == "brightdata":
         proxy = brightdata_proxy_url()

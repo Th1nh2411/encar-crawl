@@ -75,6 +75,7 @@ from db import (
     close_batch,
     connect,
     fail_batch,
+    known_details,
     lock_name,
     open_batch,
     previous_ok_count,
@@ -247,6 +248,36 @@ def crawl_listing_pages(spec: Dict[str, str]) -> Tuple[List[Dict[str, Any]], int
     return list(rows.values()), total_count, total_pages, fetched_pages
 
 
+# What a stored row may contribute to a fresh crawl: the fields that describe
+# the car itself and cannot change while the listing exists. `mileage` and
+# `price` are deliberately absent -- they move, and the listing this run just
+# read is the current answer. Copying them from the database would quietly
+# replace today's numbers with the ones from the day the car was first seen.
+REUSABLE_FIELDS = ("vehicle_no", "model_info", "manufacturer", "model_group",
+                   "model_name", "grade_name", "form_year", "year_month",
+                   "fuel_name", "transmission", "color_name")
+
+
+def apply_known(rows: List[Dict[str, Any]],
+                known: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fill in what the database already knows; return the rows still to fetch.
+
+    A car keeps its vehicle number for as long as it exists, so a listing that
+    has already been looked up needs no detail request at all.
+    """
+    remaining: List[Dict[str, Any]] = []
+    for row in rows:
+        entry = known.get(row["car_id"])
+        if not entry or not entry.get("vehicle_no"):
+            remaining.append(row)
+            continue
+        for key in REUSABLE_FIELDS:
+            value = entry.get(key)
+            if value:
+                row[key] = value
+    return remaining
+
+
 def fill_vehicle_details(rows: List[Dict[str, Any]]) -> int:
     """Fill the car number + detail fields. Returns how many plates we got."""
     def work(row: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
@@ -282,7 +313,7 @@ def mark_missing_sold(cur, model_key: str, batch_id: int,
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 def run_model(conn, spec: Dict[str, str], with_details: bool,
-              detect_sold: bool) -> Dict[str, Any]:
+              detect_sold: bool, refresh_details: bool = False) -> Dict[str, Any]:
     log(f"\n=== {spec['label']} ({spec['key']}) ===")
     started = time.perf_counter()
     seen_at = datetime.now()
@@ -301,8 +332,19 @@ def run_model(conn, spec: Dict[str, str], with_details: bool,
 
         filled = 0
         if with_details and rows:
-            log(f"  details: fetching {len(rows)} vehicle(s) ...")
-            filled = fill_vehicle_details(rows)
+            to_fetch = rows
+            if cur and not refresh_details:
+                known = known_details(cur, spec["key"])
+                to_fetch = apply_known(rows, known)
+                reused = len(rows) - len(to_fetch)
+                if reused:
+                    log(f"  details: {reused} already known, "
+                        f"{len(to_fetch)} to fetch")
+
+            if to_fetch:
+                log(f"  details: fetching {len(to_fetch)} vehicle(s) ...")
+                fill_vehicle_details(to_fetch)
+            filled = sum(1 for r in rows if r["vehicle_no"])
             log(f"  details: {filled}/{len(rows)} car numbers")
     except BaseException as exc:
         # A crashed run must not leave its batch sitting at RUNNING forever —
@@ -394,6 +436,11 @@ def main() -> int:
                         help="Model key to crawl (repeatable). Default: every model in models.json")
     parser.add_argument("--no-details", dest="details", action="store_false",
                         help="Skip the per-vehicle detail pass — leaves the car number empty")
+    parser.add_argument("--refresh-details", action="store_true",
+                        help="Re-fetch the detail of every listing, including "
+                             "ones whose car number is already stored. A car "
+                             "number never changes, so this is for repairing "
+                             "bad data, not for normal runs")
     parser.add_argument("--no-sold", dest="detect_sold", action="store_false",
                         help="Store the listings only — do not flag missing ones as SOLD")
     parser.add_argument("--no-db", action="store_true", help="Crawl only, no DB writes")
@@ -436,7 +483,9 @@ def main() -> int:
                     f"(SYNC_MODEL_COOLDOWN) ...")
                 time.sleep(MODEL_COOLDOWN)
             try:
-                summaries.append(run_model(conn, spec, args.details, args.detect_sold))
+                summaries.append(run_model(conn, spec, args.details,
+                                           args.detect_sold,
+                                           args.refresh_details))
             except Exception as exc:  # one bad model must not kill the run
                 failed = True
                 log(f"  !! {spec['key']} failed: {type(exc).__name__}: {exc}")

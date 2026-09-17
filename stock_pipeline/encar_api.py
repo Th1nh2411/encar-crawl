@@ -94,17 +94,37 @@ def backoff_for(attempt: int, throttled: bool) -> float:
 
 # ── Queries ───────────────────────────────────────────────────────────────────
 def model_query(spec: Dict[str, str]) -> str:
-    """Search expression for one model. requests handles the URL-encoding.
+    """Search expression for a models.json entry. requests handles the encoding.
 
     `car_type` is Encar's domestic flag: Y for Korean makes (현대, 기아, 제네시스,
     KG모빌리티), N for imports. A Korean model queried with N returns 0 listings,
     so it is per model; the default keeps the original import entries unchanged.
     Encar escapes ')' inside names as '_)' — write names that way in models.json.
+
+    The expression nests one level per field and stops at the last one the
+    entry fills in, so an entry can be a single model, a model group or a whole
+    manufacturer. Note the shape change at the innermost level: a field with a
+    child is `(C.Field.value._.<child>)`, the last one is just `Field.value.`.
+
+    Kept in step with listing_export/export_listings.py's copy by
+    tests/test_crawl_logic.py, which asserts the two produce the same string.
     """
-    return (
-        "(And.Hidden.N._.(C.CarType.{car_type}._.(C.Manufacturer.{manufacturer}._."
-        "(C.ModelGroup.{model_group}._.Model.{model}.))))"
-    ).format(**{"car_type": "N", **spec})
+    levels = [("CarType", spec.get("car_type") or "N")]
+    for field, key in (("Manufacturer", "manufacturer"),
+                       ("ModelGroup", "model_group"),
+                       ("Model", "model")):
+        value = spec.get(key)
+        if not value:
+            break  # a gap ends the chain: no Model without its ModelGroup
+        levels.append((field, value))
+
+    def nest(rest):
+        field, value = rest[0]
+        if len(rest) == 1:
+            return f"{field}.{value}."
+        return f"(C.{field}.{value}._.{nest(rest[1:])})"
+
+    return f"(And.Hidden.N._.{nest(levels)})"
 
 
 def plate_query(plate: str, hidden: str = "N") -> str:

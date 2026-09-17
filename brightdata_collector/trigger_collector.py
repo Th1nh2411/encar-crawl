@@ -71,7 +71,11 @@ DEFAULT_MAX_PAGE = 10
 
 # The collector runs on Bright Data's side, so polling is the only way to know
 # it finished. It answers 202 while the job is still going.
-POLL_INTERVAL = 10.0
+# Poll tight at first so a short run is not padded by a fixed 10s sleep, then
+# back off to keep a long run from hammering the API.
+POLL_START = 2.0
+POLL_MAX = 10.0
+POLL_GROWTH = 1.5
 DEFAULT_TIMEOUT = 600.0
 
 
@@ -172,6 +176,7 @@ def wait_for_rows(s: requests.Session, collection_id: str,
     found nothing -- that is a result, not an error, so it is returned as is.
     """
     started = time.time()
+    interval = POLL_START
     while True:
         resp = s.get(DATASET_URL, params={"id": collection_id}, timeout=60)
 
@@ -202,7 +207,8 @@ def wait_for_rows(s: requests.Session, collection_id: str,
                 f"fetch it later with --collection-id {collection_id}"
             )
         log(f"  ... running ({waited:.0f}s)")
-        time.sleep(POLL_INTERVAL)
+        time.sleep(interval)
+        interval = min(interval * POLL_GROWTH, POLL_MAX)
 
 
 def to_rows(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

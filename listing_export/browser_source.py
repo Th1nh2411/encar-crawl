@@ -30,7 +30,10 @@ Across runs this worked sometimes and returned nothing other times, so the
 listing step retries on a fresh CDP session, which is what changes the exit IP.
 The detail step was not affected.
 
-A residential proxy zone would remove the whole problem; see the README.
+Both steps go out from this host. Routing the detail pages through a Bright
+Data residential zone was tried and removed: without KYC the zone enforces
+Encar's robots.txt, `fem.encar.com` bars `/cars/detail/`, and every request
+came back 402. See the README.
 """
 
 from __future__ import annotations
@@ -38,7 +41,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit, parse_qs, unquote
@@ -140,13 +142,14 @@ class BrowserSource:
     """
 
     # When the listing XHR comes at all it lands within a few seconds of
-    # navigation -- measured at 2.0s to 6.4s. Waiting a full minute for it only
-    # makes a blocked attempt expensive, and being blocked is the common case.
-    XHR_TIMEOUT = 20.0
+    # navigation -- measured at 2.0s to 6.4s. Waiting longer only makes a
+    # blocked attempt expensive, and being blocked is the common case: 8s is
+    # the measured ceiling plus room, and it is the difference between a
+    # blocked page costing 20s and costing 8s, twice per run.
+    XHR_TIMEOUT = 8.0
 
     def __init__(self, ws_url: Optional[str] = None, workers: int = 8,
-                 timeout: float = 60.0, log=print, browser: str = "local",
-                 proxy_url: Optional[str] = None):
+                 timeout: float = 60.0, log=print, browser: str = "local"):
         if browser not in ("local", "brightdata"):
             raise ValueError(f"unknown browser: {browser!r}")
         if browser == "brightdata" and not ws_url:
@@ -154,7 +157,6 @@ class BrowserSource:
 
         self.ws_url = ws_url
         self.browser_kind = browser
-        self.proxy_url = proxy_url
         self.workers = workers
         self.timeout = timeout
         self.log = log
@@ -162,7 +164,6 @@ class BrowserSource:
         self._pw = None
         self._browser = None
         self._session = None
-        self._proxy_lock = threading.Lock()
 
     # ── session ───────────────────────────────────────────────────────────
 
@@ -292,40 +293,22 @@ class BrowserSource:
 
         This is plain HTTP on a thread pool, not the browser: the detail page is
         server-rendered and already carries the vehicle record as JSON in its
-        markup, so there is nothing to execute. That also lets it go through the
-        Bright Data residential proxy when one is configured -- `fem.encar.com`
-        allows `/cars/detail/` paths, unlike `api.encar.com`.
+        markup, so there is nothing to execute.
         """
         if not items:
             return []
 
         import concurrent.futures
 
-        def run(subset: List[Dict[str, Any]]):
-            session = self._http()
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(self.workers, len(subset))
-            ) as pool:
-                return list(pool.map(lambda it: self._car_number(session, it), subset))
-
-        had_proxy = bool(self.proxy_url)
-        results = run(items)
-
-        # If the proxy was dropped part-way through, the calls that went out
-        # before that happened failed for a reason that no longer applies.
-        if had_proxy and not self.proxy_url:
-            retry_idx = [i for i, (no, _) in enumerate(results) if no is None]
-            if retry_idx:
-                self.log(f"    retrying {len(retry_idx)} detail page(s) direct")
-                for i, res in zip(retry_idx, run([items[i] for i in retry_idx])):
-                    results[i] = res
-
-        return results
+        session = self._http()
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(self.workers, len(items))
+        ) as pool:
+            return list(pool.map(lambda it: self._car_number(session, it), items))
 
     def _http(self):
         if self._session is None:
             import requests
-            import urllib3
 
             session = requests.Session()
             session.trust_env = False
@@ -337,11 +320,6 @@ class BrowserSource:
                 ),
                 "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
             })
-            if self.proxy_url:
-                session.proxies = {"http": self.proxy_url, "https": self.proxy_url}
-                # Bright Data terminates TLS itself, so the chain is not Encar's.
-                session.verify = False
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             adapter = requests.adapters.HTTPAdapter(
                 pool_connections=self.workers, pool_maxsize=self.workers, max_retries=0
             )
@@ -357,36 +335,11 @@ class BrowserSource:
         url = DETAIL_PAGE.format(car_id=item.get("Id"))
         try:
             resp = session.get(url, timeout=self.timeout)
-            if resp.status_code == 402 and self._drop_proxy(resp):
-                resp = session.get(url, timeout=self.timeout)
             if resp.status_code != 200:
                 return None, fallback
             return parse_detail_page(decode(resp.content), fallback)
         except Exception:
             return None, fallback
-
-    def _drop_proxy(self, resp) -> bool:
-        """Stop using the proxy once Bright Data refuses the site outright.
-
-        A residential zone without KYC enforces the target's robots.txt, and
-        every Encar path this needs is disallowed there -- `fem.encar.com` bars
-        `/cars/detail/`. That is a verdict about the account, not a transient
-        error, so retrying through the proxy is pointless: drop it for the rest
-        of the run and go direct, which works.
-        """
-        if not self.proxy_url:
-            return False
-        with self._proxy_lock:
-            if not self.proxy_url:  # another thread got here first
-                return True
-            reason = "KYC" if b"kyc" in resp.content.lower() else "refused"
-            self.log(f"    Bright Data proxy {reason} for the detail pages "
-                     f"(HTTP 402) -- continuing direct")
-            self.proxy_url = None
-            if self._session is not None:
-                self._session.proxies = {}
-                self._session.verify = True
-        return True
 
     # ── teardown ──────────────────────────────────────────────────────────
 

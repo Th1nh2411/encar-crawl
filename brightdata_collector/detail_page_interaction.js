@@ -6,20 +6,21 @@ if (!carid_match) {
 const carid = carid_match[1] || carid_match[2];
 const detail_url = `https://fem.encar.com/cars/detail/${carid}`;
 
-// Điều hướng tới trang chi tiết
+// Trang detail được server render sẵn, bản ghi xe nằm trong HTML ngay từ
+// response đầu tiên. Không cần chờ JS chạy xong, nên domcontentloaded là đủ —
+// và không cần wait('body') sau đó, vì navigate đã trả về khi DOM sẵn sàng.
 try {
     navigate(detail_url, { wait_until: 'domcontentloaded', timeout: 30000 });
 } catch (err) {
-    console.log("Lỗi khi gọi navigate, thử tiếp tục xử lý trang hiện tại...");
+    // Trang lỗi vẫn parse được (có thể là trang chặn), nên thử tiếp thay vì bỏ.
+    console.log("navigate lỗi, thử parse trang hiện tại...");
 }
 
-// Sửa lại thành dùng CSS selector thay vì truyền số (chờ phần tử body xuất hiện)
-wait('body'); 
-
-// Kiểm tra xem trang có bị lỗi không
+// Xe đã gỡ tin trả về trang lỗi. Ghi lại như dead_page thay vì để parser trả
+// về car_number rỗng — rỗng vì bị chặn và rỗng vì xe không còn là hai chuyện
+// khác nhau.
 if (el_exists('.-z7xRIMV9Y') || el_exists('.error_page')) {
   collect({ status: "dead_page", url: detail_url });
 } else {
-  // Tiến hành parse dữ liệu bình thường
   collect(parse());
 }

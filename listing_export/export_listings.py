@@ -56,7 +56,7 @@ import math
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -95,18 +95,83 @@ DEFAULT_WORKERS = 8
 # place to pace itself. One page's worth of cars is far below this.
 DETAIL_CHUNK = 100
 
+# Listing pages are chunked for the same reason. A 1130-car model is 57 pages
+# and fits in one batch; a 16000-car one is 800, and sending those with nothing
+# between them is how a run spends its whole rate-limit budget before it has
+# fetched a single car.
+LISTING_CHUNK = 50
+
+# A listing page that survives the in-batch retries gets one more attempt after
+# this, which is longer than the 10s those use: what is left at that point is a
+# block that needs real time, not another immediate retry.
+LISTING_RETRY_BACKOFF = 30.0
+
+# What Encar's rate limit looks like from here, measured over a session of runs
+# rather than read off any documentation:
+#
+#   - 1187 requests in 33s went through, ~20 of them throttled mid-run.
+#   - The next run, with no pause, was refused at its first request.
+#   - After 3 minutes still refused; after 8, fine.
+#   - Dropping workers from 8 to 2 changed nothing, so it counts requests, not
+#     how many are in flight.
+#
+# It behaves like a budget of ~1200 requests over a window of a few minutes. A
+# run under that needs no brake; a run over it has to hold a sustainable rate
+# instead, which is that budget spread across the window.
+RATE_BUDGET = 1200
+RATE_WINDOW = 300.0
+SAFE_RATE = RATE_BUDGET / RATE_WINDOW  # 4 requests/second
+
+# How long a chunk of requests takes on its own, measured at ~36 req/s over 8
+# workers. The pause is whatever is left of the time the chunk is allowed.
+CHUNK_SECONDS = 2.8
+
+
+def auto_delay(requests: int, chunk: int) -> float:
+    """Seconds to pause between chunks for a run of `requests` requests.
+
+    Zero for anything that fits inside the budget -- a small run should not be
+    slowed down to guard against a limit it will never reach.
+    """
+    if requests <= RATE_BUDGET:
+        return 0.0
+    return max(round(chunk / SAFE_RATE - CHUNK_SECONDS, 1), 0.0)
+
+
+def paced(delay: Optional[float], requests: int, chunk: int, what: str) -> float:
+    """Resolve `delay`, where None means "work it out from the size"."""
+    if delay is not None:
+        return delay
+    value = auto_delay(requests, chunk)
+    if value:
+        log(f"    pacing {what}: {requests} requests > {RATE_BUDGET} budget "
+            f"-> {value:.0f}s between chunks")
+    return value
+
 # Encar's rate limit needs real time to clear from this host, so a retry a
 # second later just burns the attempt. Escalating to Bright Data is both faster
 # and likelier to work; the wait is what is left when there is nothing to
 # escalate to.
-THROTTLE_BACKOFF = 20.0
+THROTTLE_BACKOFF: float = 20.0
+
+# How many times a throttled request is repeated. main.py lowers this, because
+# it has a slower route to fall through to and needs the block established
+# rather than waited out.
+MAX_THROTTLE_ROUNDS: int = 3
+
+# Retries for the very first request of a run, which is the listing call that
+# every other request waits on. Throttled there means the host is blocked, not
+# that this one call was unlucky: measured, a retry 10s later comes back 407
+# again, while mid-run throttles clear on the first retry. None follows
+# MAX_THROTTLE_ROUNDS; main.py sets 0 because it has another route to try and
+# the 10s buys nothing.
+FIRST_BATCH_ROUNDS: Optional[int] = None
 
 # On Bright Data the picture is different. CloudFront throttles its exit IPs
 # individually and unpredictably -- measured over repeated runs, the search
 # endpoint came back 407 on roughly two attempts in three. Each batch opens a
 # fresh CDP connection and so tends to land on a different exit IP, which makes
 # retrying there cheap and worthwhile where waiting is not.
-MAX_THROTTLE_ROUNDS = 3
 BD_RETRY_PAUSE = 2.0
 
 
@@ -132,16 +197,42 @@ def load_model_spec(key: str) -> Dict[str, str]:
 
 
 def model_query(spec: Dict[str, str]) -> str:
-    """Encar's search expression for one model.
+    """Encar's search expression for a spec, at whatever depth it gives.
 
     `Hidden.N` restricts it to listings currently advertised. `car_type` is the
     domestic flag -- Y for Korean makes, N for imports -- and defaults to N,
     matching the existing entries. The client does the URL-encoding.
+
+    The expression nests one level per field, and stops at the last one the
+    spec actually fills in, so the same models.json entry shape covers a single
+    model or a whole manufacturer:
+
+        model      (And.Hidden.N._.(C.CarType.N._.(C.Manufacturer.BMW._.
+                   (C.ModelGroup.3시리즈._.Model.3시리즈 (G20_).))))
+        group      (And.Hidden.N._.(C.CarType.N._.(C.Manufacturer.BMW._.
+                   ModelGroup.3시리즈.)))
+        make       (And.Hidden.N._.(C.CarType.N._.Manufacturer.벤츠.))
+
+    Note the shape change at the innermost level: a field with a child below it
+    is written `(C.Field.value._.<child>)`, and the last one is just
+    `Field.value.` -- which is why this is built rather than formatted.
     """
-    return (
-        "(And.Hidden.N._.(C.CarType.{car_type}._.(C.Manufacturer.{manufacturer}._."
-        "(C.ModelGroup.{model_group}._.Model.{model}.))))"
-    ).format(**{"car_type": "N", **spec})
+    levels = [("CarType", spec.get("car_type") or "N")]
+    for field, key in (("Manufacturer", "manufacturer"),
+                       ("ModelGroup", "model_group"),
+                       ("Model", "model")):
+        value = spec.get(key)
+        if not value:
+            break  # a gap ends the chain: no Model without its ModelGroup
+        levels.append((field, value))
+
+    def nest(rest: List[Tuple[str, str]]) -> str:
+        field, value = rest[0]
+        if len(rest) == 1:
+            return f"{field}.{value}."
+        return f"(C.{field}.{value}._.{nest(rest[1:])})"
+
+    return f"(And.Hidden.N._.{nest(levels)})"
 
 
 class FailoverFetcher:
@@ -155,9 +246,9 @@ class FailoverFetcher:
     def __init__(self, mode: str, workers: int):
         self.mode = mode
         self.workers = workers
-        self.escalated = mode == "brightdata"
+        self.escalated = mode in ("brightdata", "scrapingbee")
         self.transport = make_transport(
-            "brightdata" if mode == "brightdata" else "direct", workers
+            mode if mode in ("brightdata", "scrapingbee") else "direct", workers
         )
 
     def _escalate(self) -> bool:
@@ -168,11 +259,20 @@ class FailoverFetcher:
         self.escalated = True
         return True
 
-    def run(self, reqs: Sequence[Req]) -> List[Result]:
-        """One batch, re-running whatever Encar throttled until it lands."""
+    def run(self, reqs: Sequence[Req],
+            rounds: Optional[int] = None) -> List[Result]:
+        """One batch, re-running whatever Encar throttled until it lands.
+
+        `rounds` overrides how many times a throttled request is repeated.
+        Waiting is worth it mid-run, where a throttle is a passing dip and the
+        alternative is losing those cars; it is not worth it on the very first
+        request, where a throttle means the host is blocked outright and a
+        caller with another route to try is better off hearing that now. See
+        FIRST_BATCH_ROUNDS.
+        """
         batch = self.transport.get_many(reqs)
 
-        for _ in range(MAX_THROTTLE_ROUNDS):
+        for _ in range(MAX_THROTTLE_ROUNDS if rounds is None else rounds):
             throttled = [i for i, r in enumerate(batch) if r.throttled]
             if not throttled:
                 break
@@ -293,16 +393,26 @@ def throttle_hint(fetcher: "FailoverFetcher", result: Result) -> str:
 
 
 def fetch_listing_pages(fetcher: "FailoverFetcher", section: str, query: str,
-                        pages: Optional[List[int]], limit: int) -> List[Dict[str, Any]]:
+                        pages: Optional[List[int]], limit: int,
+                        coverage: Optional[Dict[str, Any]] = None,
+                        delay: Optional[float] = 0.0,
+                        cache=None) -> List[Dict[str, Any]]:
     """Listing items for the requested pages, in page order.
 
     The first page is fetched on its own because it is what reports `Count`,
     and with `--pages all` that Count is what says how many pages there are.
     The rest go out as one batch: they are independent requests and there is
     nothing to gain by walking them one at a time.
+
+    A page that never lands is the dangerous case: its 20 cars are simply
+    absent from the result, and every later count -- "1020/1020 car numbers" --
+    is computed over what did arrive, so a run that lost 110 cars still reports
+    itself as complete. `coverage` is filled in with what was asked for against
+    what arrived, so the caller can tell the difference.
     """
     first_page = 1 if pages is None else pages[0]
-    first = fetcher.run([listing_request(section, query, first_page, limit, True)])[0]
+    first = fetcher.run([listing_request(section, query, first_page, limit, True)],
+                        rounds=FIRST_BATCH_ROUNDS)[0]
     if not first.ok:
         raise SystemExit(f"Could not read page {first_page}: {first.error}"
                          f"{throttle_hint(fetcher, first)}")
@@ -323,19 +433,73 @@ def fetch_listing_pages(fetcher: "FailoverFetcher", section: str, query: str,
     for it in items:
         it["_page"] = first_page
 
+    def fetch_pages(page_nos: List[int], pause: float) -> List[int]:
+        """Fetch these pages into `items`; return the ones that never landed.
+
+        Chunked, because one batch of 800 listing requests is 800 requests
+        with nothing between them -- which is exactly how a run walks into the
+        rate limit. `--delay` applies here for the same reason it applies to
+        the detail calls: it is the only brake the run has.
+        """
+        missed: List[int] = []
+        for start in range(0, len(page_nos), LISTING_CHUNK):
+            chunk = page_nos[start:start + LISTING_CHUNK]
+            batch = fetcher.run([
+                listing_request(section, query, p, limit, False) for p in chunk
+            ])
+            for page_no, result in zip(chunk, batch):
+                if not result.ok:
+                    log(f"    ! page {page_no}: {result.error}")
+                    missed.append(page_no)
+                    continue
+                page_items = (result.data or {}).get("SearchResults") or []
+                for it in page_items:
+                    it["_page"] = page_no
+                items.extend(page_items)
+
+            if len(page_nos) > LISTING_CHUNK:
+                done = min(start + LISTING_CHUNK, len(page_nos))
+                log(f"    listing {done}/{len(page_nos)} pages")
+                if pause and done < len(page_nos):
+                    time.sleep(pause)
+        return missed
+
     rest = [p for p in pages if p != first_page]
-    if rest:
-        batch = fetcher.run([
-            listing_request(section, query, p, limit, False) for p in rest
-        ])
-        for page_no, result in zip(rest, batch):
-            if not result.ok:
-                log(f"    ! page {page_no}: {result.error}")
-                continue
-            page_items = (result.data or {}).get("SearchResults") or []
-            for it in page_items:
-                it["_page"] = page_no
-            items.extend(page_items)
+    # Now that Count is in, the size of the run is known: every page costs one
+    # listing request and up to `limit` detail ones -- minus whatever the cache
+    # already covers, which on a repeat run is most of them. Counting those as
+    # requests would brake a run that is not going to make them.
+    cached = len(getattr(cache, "entries", ()) or ()) if cache is not None else 0
+    estimate = len(pages) * (1 + limit) - min(cached, len(pages) * limit)
+    pace = paced(delay, estimate, LISTING_CHUNK, "listing")
+    failed = fetch_pages(rest, pace) if rest else []
+
+    # A listing page that never landed takes its whole page of cars with it, so
+    # it is worth one more try after a longer wait than the in-batch retries
+    # use. Measured: a throttle that survives three 10s rounds has usually
+    # cleared by the time this comes round.
+    if failed:
+        log(f"  {len(failed)} listing page(s) missing, retrying after "
+            f"{LISTING_RETRY_BACKOFF:.0f}s")
+        time.sleep(LISTING_RETRY_BACKOFF)
+        failed = fetch_pages(sorted(failed), pace)
+
+    if coverage is not None:
+        # The last page holds the remainder, so the expected count is the
+        # listing total clipped to the pages actually asked for.
+        expected = sum(limit if p < total_pages else total - (total_pages - 1) * limit
+                       for p in pages) if total else len(items)
+        coverage.update({
+            "listingTotal": total,
+            "pagesRequested": len(pages),
+            "pagesFailed": sorted(failed),
+            "expectedCars": max(expected, 0),
+            "missingCars": max(expected - len(items), 0),
+        })
+
+    if failed:
+        log(f"  ! {len(failed)} of {len(pages)} listing page(s) never landed: "
+            f"about {len(failed) * limit} cars are missing from this run")
 
     log(f"  listing: {len(items)} cars from {len(pages)} page(s) "
         f"of {total} total")
@@ -343,9 +507,30 @@ def fetch_listing_pages(fetcher: "FailoverFetcher", section: str, query: str,
 
 
 def fetch_car_numbers(fetcher: "FailoverFetcher", items: List[Dict[str, Any]],
-                      delay: float) -> List[Dict[str, Any]]:
-    """Car number and model info per listing, in chunks so progress is visible."""
+                      delay: Optional[float], cache=None) -> List[Dict[str, Any]]:
+    """Car number and model info per listing, in chunks so progress is visible.
+
+    With a cache, the ids it already knows never become requests at all: a
+    vehicle number does not change, so the only cars worth asking about are the
+    ones this host has not seen before.
+    """
     rows: List[Dict[str, Any]] = []
+    # Cached cars are not fetched, so they would otherwise all end up ahead of
+    # the fetched ones. The listing order is the order the site gave, and the
+    # output is expected to be in it.
+    order = {str(it.get("Id")): i for i, it in enumerate(items)}
+
+    if cache is not None and cache.enabled:
+        known, items = cache.split(items)
+        for item, entry in known:
+            rows.append(row(item.get("_page"), item.get("Id"),
+                            entry.get("car_number"),
+                            entry.get("model_info") or listing_model_info(item)))
+        if known:
+            log(f"  cache: {len(known)} known, {len(items)} to fetch")
+
+    # Cache hits are not requests, so the pace is set by what is left to fetch.
+    delay = paced(delay, len(items), DETAIL_CHUNK, "detail")
 
     for start in range(0, len(items), DETAIL_CHUNK):
         chunk = items[start:start + DETAIL_CHUNK]
@@ -362,11 +547,12 @@ def fetch_car_numbers(fetcher: "FailoverFetcher", items: List[Dict[str, Any]],
             # for -- a missing number is visible instead of silently absent.
             if not detail.ok and not detail.gone:
                 log(f"    ! detail {item.get('Id')}: {detail.error}")
-            rows.append(row(
-                item.get("_page"), item.get("Id"), data.get("vehicleNo") or None,
-                detail_model_info(data.get("category") or {}, fallback)
-                if detail.ok else fallback,
-            ))
+            car_number = data.get("vehicleNo") or None
+            info = (detail_model_info(data.get("category") or {}, fallback)
+                    if detail.ok else fallback)
+            rows.append(row(item.get("_page"), item.get("Id"), car_number, info))
+            if cache is not None:
+                cache.remember(item.get("Id"), car_number, info)
 
         if len(items) > DETAIL_CHUNK:
             done = min(start + DETAIL_CHUNK, len(items))
@@ -374,14 +560,20 @@ def fetch_car_numbers(fetcher: "FailoverFetcher", items: List[Dict[str, Any]],
             if delay and done < len(items):
                 time.sleep(delay)
 
+    rows.sort(key=lambda r: order.get(str(r["car_id"]), len(order)))
     return rows
 
 
 def run_summary(model_key: str, spec: Dict[str, str], section: str, source: str,
-                transport: str, rows: List[Dict[str, Any]],
-                elapsed: float) -> Dict[str, Any]:
-    """The metadata half of the output document; results.save() adds the rows."""
-    return {
+                transport: str, rows: List[Dict[str, Any]], elapsed: float,
+                coverage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The metadata half of the output document; results.save() adds the rows.
+
+    `complete` is the field to read before trusting a run: a listing page that
+    never landed takes its 20 cars with it, and every other count here is
+    computed over the rows that did arrive.
+    """
+    summary = {
         "model": model_key,
         "label": spec.get("label"),
         "section": section,
@@ -391,32 +583,37 @@ def run_summary(model_key: str, spec: Dict[str, str], section: str, source: str,
         "carNumbersFilled": sum(1 for r in rows if r["car_number"]),
         "elapsedSeconds": round(elapsed, 2),
     }
+    if coverage:
+        summary.update(coverage)
+        summary["complete"] = not coverage.get("missingCars")
+    return summary
 
 
 def export_via_browser(model_key: str, section: str, pages: Optional[List[int]],
                        limit: int, workers: int, with_detail: bool = True,
-                       delay: float = 0.0, browser: str = "local") -> Dict[str, Any]:
+                       delay: Optional[float] = 0.0, browser: str = "local",
+                       cache=None) -> Dict[str, Any]:
     """`--source page`: read the site the way a browser does. See browser_source.py.
 
     The listing comes from the search page's own XHR and the car number from
-    the detail page's HTML, so no Encar API is called directly.
+    the detail page's HTML, so no Encar API is called directly. Both steps go
+    out from this host: routing the detail pages through the Bright Data proxy
+    zone was tried and removed, because a zone without KYC enforces Encar's
+    robots.txt and answers 402 on every one of them.
     """
     from browser_source import BrowserSource
-    from http_transport import brightdata_ws_url, brightdata_proxy_url
+    from http_transport import brightdata_ws_url
 
     spec = load_model_spec(model_key)
     action = model_query(spec)
-    proxy = brightdata_proxy_url()
     source = BrowserSource(
-        ws_url=brightdata_ws_url(), workers=workers, log=log,
-        browser=browser, proxy_url=proxy,
+        ws_url=brightdata_ws_url(), workers=workers, log=log, browser=browser,
     )
     started = time.time()
 
     try:
         log(f"Model {model_key} ({spec.get('label', '?')}), section {section}, "
-            f"source page (listing: {browser} browser, "
-            f"detail: {'residential proxy' if proxy else 'direct'})")
+            f"source page (listing: {browser} browser, detail: direct)")
 
         # With `all`, page 1 is what reports Count, so the rest is only known
         # after it lands.
@@ -446,10 +643,27 @@ def export_via_browser(model_key: str, section: str, pages: Optional[List[int]],
             items = data.get("SearchResults") or []
             log(f"  page {page_no}: {len(items)} cars")
 
-            if with_detail:
-                found = source.car_numbers(items)
-            else:
+            if not with_detail:
                 found = [(None, listing_model_info(it)) for it in items]
+            elif cache is not None and cache.enabled:
+                # Detail pages are this route's slow half -- one HTTP fetch of
+                # ~200 KB per car -- so a cache hit saves far more here than on
+                # the API route.
+                known, to_fetch = cache.split(items)
+                found_map = {str(it.get("Id")): (e.get("car_number"),
+                                                 e.get("model_info") or
+                                                 listing_model_info(it))
+                             for it, e in known}
+                if known:
+                    log(f"    cache: {len(known)} known, {len(to_fetch)} to fetch")
+                for it, (car_number, info) in zip(to_fetch,
+                                                  source.car_numbers(to_fetch)):
+                    found_map[str(it.get("Id"))] = (car_number, info)
+                    cache.remember(it.get("Id"), car_number, info)
+                found = [found_map.get(str(it.get("Id")), (None, listing_model_info(it)))
+                         for it in items]
+            else:
+                found = source.car_numbers(items)
 
             for item, (car_number, info) in zip(items, found):
                 rows.append(row(page_no, item.get("Id"), car_number, info))
@@ -461,15 +675,18 @@ def export_via_browser(model_key: str, section: str, pages: Optional[List[int]],
         filled = sum(1 for r in rows if r["car_number"])
         log(f"  {filled}/{len(rows)} car numbers in {elapsed:.2f}s (page source)")
 
-        return {"rows": rows, **run_summary(model_key, spec, section, "page",
-                                            f"{browser}-browser", rows, elapsed)}
+        summary = run_summary(model_key, spec, section, "page",
+                              f"{browser}-browser", rows, elapsed)
+        if cache is not None:
+            summary.update(cache.summary())
+        return {"rows": rows, **summary}
     finally:
         source.close()
 
 
 def export_via_api(model_key: str, section: str, pages: Optional[List[int]],
                    limit: int, workers: int, mode: str, with_detail: bool = True,
-                   delay: float = 0.0) -> Dict[str, Any]:
+                   delay: Optional[float] = 0.0, cache=None) -> Dict[str, Any]:
     """`--source api`: call api.encar.com directly, with Bright Data as fallback."""
     spec = load_model_spec(model_key)
     fetcher = FailoverFetcher(mode, workers)
@@ -479,10 +696,12 @@ def export_via_api(model_key: str, section: str, pages: Optional[List[int]],
         log(f"Model {model_key} ({spec.get('label', '?')}), "
             f"section {section}, transport {fetcher.name}")
 
-        items = fetch_listing_pages(fetcher, section, model_query(spec), pages, limit)
+        coverage: Dict[str, Any] = {}
+        items = fetch_listing_pages(fetcher, section, model_query(spec), pages,
+                                    limit, coverage, delay, cache)
 
         if with_detail:
-            rows = fetch_car_numbers(fetcher, items, delay)
+            rows = fetch_car_numbers(fetcher, items, delay, cache)
         else:
             # Without the detail pass there is no car number to be had; the
             # listing carries the model only.
@@ -491,10 +710,17 @@ def export_via_api(model_key: str, section: str, pages: Optional[List[int]],
 
         elapsed = time.time() - started
         filled = sum(1 for r in rows if r["car_number"])
-        log(f"  {filled}/{len(rows)} car numbers in {elapsed:.2f}s ({fetcher.name})")
+        missing = coverage.get("missingCars") or 0
+        of_expected = (f" of {coverage['expectedCars']} expected"
+                       if missing else "")
+        log(f"  {filled}/{len(rows)}{of_expected} car numbers in "
+            f"{elapsed:.2f}s ({fetcher.name})")
 
-        return {"rows": rows, **run_summary(model_key, spec, section, "api",
-                                            fetcher.name, rows, elapsed)}
+        summary = run_summary(model_key, spec, section, "api", fetcher.name,
+                              rows, elapsed, coverage)
+        if cache is not None:
+            summary.update(cache.summary())
+        return {"rows": rows, **summary}
     finally:
         fetcher.close()
 
@@ -514,8 +740,13 @@ def main() -> int:
                         help=f"cars per page (default: {DEFAULT_LIMIT})")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"requests in flight (default: {DEFAULT_WORKERS})")
-    parser.add_argument("--delay", type=float, default=0.0,
-                        help="seconds to pause between detail chunks on a long run")
+    parser.add_argument("--delay", type=float, default=None,
+                        help=f"seconds to pause between chunks of requests. "
+                             f"Left out, it is worked out from the size of the "
+                             f"run once Count is known: nothing below Encar's "
+                             f"budget of ~{RATE_BUDGET} requests, and enough "
+                             f"to hold ~{SAFE_RATE:.0f} requests/second above "
+                             f"it. 0 disables it")
     parser.add_argument("--no-detail", action="store_true",
                         help="skip the per-car requests -- fast, but no car number")
     parser.add_argument("--source", choices=("page", "api"), default="page",

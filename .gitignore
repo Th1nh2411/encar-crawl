@@ -19,6 +19,11 @@ output/
 logs/
 *.log
 
+# State the next run reads: the plate cache and the throttle memory. Separate
+# from output/ because these are not results — deleting the cache costs
+# thousands of requests to rebuild it.
+var/
+
 # Ad-hoc exports that predate output/
 /out.json
 /out.csv

@@ -1,7 +1,19 @@
 {
   "extraPaths": [
+    ".",
     "listing_export",
     "brightdata_collector",
     "stock_pipeline"
+  ],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": [
+        ".",
+        "listing_export",
+        "brightdata_collector",
+        "stock_pipeline"
+      ]
+    }
   ]
 }
