@@ -37,6 +37,7 @@
   header { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
   h1 { font-size: 18px; margin: 0; font-weight: 680; letter-spacing: -.01em; }
   .spacer { flex: 1; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   select, input[type=search] { font: inherit; padding: 7px 10px; border: 1px solid var(--line);
     border-radius: 8px; background: var(--panel); color: var(--ink); max-width: 100%; }
   .btn { border: 1px solid var(--line); background: var(--panel); color: var(--ink);
@@ -157,11 +158,14 @@
   <header>
     <h1>Encar stock tracker</h1>
     <span class="spacer"></span>
-    <select id="crawlmodel" aria-label="Model to crawl">
-      <option value="">All models</option>
-      {% for m in models %}<option value="{{ m.key }}">{{ m.label }}</option>{% endfor %}
-    </select>
-    <button class="btn primary" id="crawlbtn">Crawl now</button>
+    <div class="actions">
+      <select id="crawlmodel" aria-label="Model to crawl">
+        {% for m in models %}<option value="{{ m.key }}">{{ m.label }}</option>{% endfor %}
+        <option value="">All models (slow)</option>
+      </select>
+      <button class="btn primary job-btn" id="crawlbtn">Crawl now</button>
+      <button class="btn job-btn" id="importbtn" title="Reload the sonokong stock from data/">Import stock</button>
+    </div>
   </header>
 
   <div class="lastruns">
@@ -177,12 +181,14 @@
   </div>
 
   <div class="panel" id="runbox">
-    <div class="panel-hd"><span class="dot"></span><h2 id="runtitle">Crawling…</h2></div>
+    <div class="panel-hd"><span class="dot"></span><h2 id="runtitle">Working…</h2>
+      <span class="spacer"></span><button class="btn" id="runclose" type="button">Hide</button></div>
     <pre id="runout"></pre>
   </div>
 
   <nav>
     <a href="/" class="{{ 'on' if view in ('cars', 'car') }}">Cars</a>
+    <a href="/check" class="{{ 'on' if view == 'check' }}">Check plate</a>
     <a href="/runs" class="{{ 'on' if view == 'runs' }}">Crawl runs</a>
   </nav>
 
@@ -229,6 +235,11 @@
       {% if filters.q or filters.model or filters.scope or filters.status %}
         <a class="btn" href="/">Clear</a>
       {% endif %}
+      <span class="spacer"></span>
+      <span class="seg" title="Download what this page shows, every page of it">
+        <a href="/export.csv{{ ('?' ~ request.query_string.decode()) if request.query_string else '' }}">Export CSV</a>
+        <a href="/export.json{{ ('?' ~ request.query_string.decode()) if request.query_string else '' }}">JSON</a>
+      </span>
     </form>
 
     {% if no_plate or hidden_test %}
@@ -378,6 +389,23 @@
     </div>
   </div>
 
+{% elif view == 'check' %}
+  {# ── Live lookup by plate ─────────────────────────────────────────────── #}
+  <div class="panel">
+    <div class="panel-hd"><h2>Check plates on Encar now</h2>
+      <span class="muted">A live search per plate, shown next to what the database says. Nothing is saved.</span></div>
+    <form id="checkform" class="filters" style="flex-direction: column; align-items: stretch">
+      <textarea id="plates" rows="5" placeholder="One plate per line, e.g.&#10;110모5877&#10;269로1841"
+        style="font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); resize: vertical"></textarea>
+      <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap">
+        <button class="btn primary" id="checkbtn">Check</button>
+        <label class="muted"><input type="checkbox" id="verify"> verify each ad's plate (slower)</label>
+        <span class="muted" id="checkmsg"></span>
+      </div>
+    </form>
+    <div class="scroll" id="checkout"></div>
+  </div>
+
 {% else %}
   {# ── Crawl runs ───────────────────────────────────────────────────────── #}
   {% set parked = routes|selectattr('left')|list %}
@@ -452,7 +480,7 @@
 </div>
 
 <script>
-const btn = document.getElementById('crawlbtn');
+const jobBtns = document.querySelectorAll('.job-btn');
 const box = document.getElementById('runbox');
 const out = document.getElementById('runout');
 const title = document.getElementById('runtitle');
@@ -462,16 +490,14 @@ let polling = null;
 let sawRunning = false;
 
 function render(state, message) {
-  if (state.running || (state.output && state.output.length)) box.classList.add('on');
-  btn.disabled = !!state.running;
-  btn.textContent = state.running ? 'Crawling…' : 'Crawl now';
+  if (state.running || message) box.classList.add('on');
+  jobBtns.forEach(b => b.disabled = !!state.running);
   if (state.running) {
     dot.style.display = '';
-    title.textContent = 'Crawling ' + (state.models.join(', ') || 'all models') +
-                        ' — started ' + (state.startedAt || '').replace('T', ' ');
+    title.textContent = state.label + ' — started ' + (state.startedAt || '').replace('T', ' ');
   } else if (state.returncode !== null && state.returncode !== undefined) {
-    const codes = {0: 'Done', 1: 'A model failed', 2: 'Another crawl is already running'};
-    title.textContent = codes[state.returncode] || ('Finished (exit ' + state.returncode + ')');
+    const codes = {0: 'done', 1: 'finished with errors', 2: 'another crawl is already running'};
+    title.textContent = state.label + ': ' + (codes[state.returncode] || 'exit ' + state.returncode);
     dot.style.display = 'none';
   }
   const lines = (state.output || []).join('\n');
@@ -480,7 +506,7 @@ function render(state, message) {
 }
 
 async function poll() {
-  const state = await (await fetch('/api/crawl/status')).json();
+  const state = await (await fetch('/api/job')).json();
   render(state);
   if (state.running) {
     sawRunning = true;
@@ -488,20 +514,63 @@ async function poll() {
     return;
   }
   if (polling) { clearInterval(polling); polling = null; }
-  if (sawRunning) { sawRunning = false; setTimeout(() => location.reload(), 1200); }
+  if (sawRunning) { sawRunning = false; setTimeout(() => location.reload(), 1500); }
 }
 
-btn.addEventListener('click', async () => {
-  const model = document.getElementById('crawlmodel').value;
-  btn.disabled = true;
-  const r = await fetch('/api/crawl', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({models: model ? [model] : []}),
-  });
-  const data = await r.json();
+async function post(url, body) {
+  const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                              body: JSON.stringify(body || {})});
+  return r.json();
+}
+
+async function startJob(url, body) {
+  jobBtns.forEach(b => b.disabled = true);
+  const data = await post(url, body);
   render(data, data.message);
   if (!polling) polling = setInterval(poll, 1500);
+}
+
+document.getElementById('crawlbtn').addEventListener('click', () => {
+  const model = document.getElementById('crawlmodel').value;
+  if (!model && !confirm('Crawl every model in models.json? Large makes take hours the first time.')) return;
+  startJob('/api/crawl', {models: model ? [model] : []});
 });
+document.getElementById('importbtn').addEventListener('click', () => {
+  if (confirm('Replace the stock tables with the dumps in data/?')) startJob('/api/import-stock');
+});
+document.getElementById('runclose').addEventListener('click', () => box.classList.remove('on'));
+
+// ── Check plate ──
+const checkform = document.getElementById('checkform');
+if (checkform) {
+  const meta = {{ status_meta|tojson }};
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  checkform.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('checkbtn');
+    const msg = document.getElementById('checkmsg');
+    const plates = document.getElementById('plates').value;
+    btn.disabled = true; msg.textContent = 'Checking…';
+    const t0 = Date.now();
+    const data = await post('/api/check-plate', {plates, verify: document.getElementById('verify').checked});
+    btn.disabled = false;
+    if (!data.ok) { msg.textContent = data.message; return; }
+    msg.textContent = data.results.length + ' plate(s) in ' + ((Date.now() - t0) / 1000).toFixed(1) + 's';
+    const now = {ON_SALE: ['ok', 'On sale · 판매중'], SOLD_OUT: ['sold', 'Not listed · 판매완료'], ERROR: ['plain', 'Error']};
+    let html = '<table><thead><tr><th>Plate</th><th>Encar now</th><th>Ads</th><th>Database</th><th>Note</th></tr></thead><tbody>';
+    for (const r of data.results) {
+      const [tone, label] = now[r.status];
+      const db = meta[r.dbStatus];
+      const dbCell = db ? `<a href="/car/${encodeURIComponent(r.plate)}"><span class="pill t-${db.tone}">${db.en} · ${db.ko}</span></a>`
+                        : `<span class="faint">${esc(r.dbStatus || '—')}</span>`;
+      const ads = (r.listings || []).map(l =>
+        `<a href="${esc(l.url)}" target="_blank" rel="noopener">#${esc(l.carId)}</a> ${esc(l.price)}만원`).join('<br>');
+      html += `<tr><td class="plate">${esc(r.plate)}</td><td><span class="pill t-${tone}">${label}</span></td>
+               <td>${ads || '<span class="faint">—</span>'}</td><td>${dbCell}</td><td class="muted">${esc(r.note)}</td></tr>`;
+    }
+    document.getElementById('checkout').innerHTML = html + '</tbody></table>';
+  });
+}
 
 poll();
 </script>

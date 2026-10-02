@@ -3,7 +3,7 @@ log.py -- The one logging call, plus the file it can tee into.
 
 Progress goes to stderr so stdout stays free for a JSON document (--print).
 Once setup_file_log() has run, every line is also appended to a rotating file:
-cron discards the console, and the dashboard reads that file.
+a background job has no console, and the dashboard reads that file.
 """
 
 from __future__ import annotations

@@ -7,9 +7,12 @@ routes to one result, not separate tools, so they share one row shape and land
 in one SQLite file, `var/encar.db`. The dashboard, the exports and sold
 detection all read that file.
 
-    python main.py crawl                         # every model, every page
+    pip install -r requirements.txt
+    python main.py dashboard                     # http://127.0.0.1:5050 — everything else is a button there
+
+or from a shell:
+
     python main.py crawl --model bmw_3series_g20
-    python main.py dashboard                     # http://127.0.0.1:5050
     python main.py export --view cars            # JSON + CSV into output/cars/
     python main.py check-plate 110모5877          # live lookup by plate
     python main.py import-stock                  # sonokong stock from data/
@@ -125,39 +128,72 @@ To resolve the stock's 미확인 cars, add their models (Korean makes need
       plates.py stock_import.py export.py
     collector/           the Bright Data collector's own scripts (run in its IDE)
     data/                sonokong dumps, sample plate list
+    deploy/              systemd unit + Apache vhost for a server
+    scripts/             install-launchd.sh (Mac: keep the dashboard online)
     var/                 encar.db (+ crawl.lock) — the data; back it up
     output/  logs/       exports and the run log; safe to delete
 
 `var/`, `output/` and `logs/` are not tracked in git.
 
-## Setup
+## The dashboard
 
-    pip install requests python-dotenv flask   # + playwright for page-local
-    cp .env.example .env                        # proxy / collector credentials
-    python main.py import-stock
-    python main.py crawl --model bmw_3series_g20
+Everything is done from the web UI; nothing runs on a schedule.
 
-## Online
+| Action | Where | What it does |
+|---|---|---|
+| **Crawl now** | header, with a model picker | `main.py crawl` for that model, in the background; output shown live |
+| **Import stock** | header | Reloads the sonokong stock from `data/` |
+| **Export CSV / JSON** | Cars page | Downloads the cars view exactly as filtered |
+| **Check plate** | Check plate tab | Live Encar lookup for up to 50 plates, next to the database's status |
+| Cars / car page / Crawl runs | tabs | Status per plate, one car's ads and stock record, crawl history and log |
+
+One background job at a time (crawl or import); a second is refused until it
+finishes. The same commands still work from a shell (`python main.py …`).
+
+Login: `DASHBOARD_USER` / `DASHBOARD_PASSWORD` in `.env` (HTTP Basic). With no
+password the dashboard answers only direct local requests and refuses anything
+that comes through a proxy (Apache, Cloudflare) — it cannot go online open.
+
+## Server (Apache)
+
+    sudo useradd -r -m -d /opt/encar-crawl encar
+    sudo -u encar git clone https://github.com/Th1nh2411/encar-crawl.git /opt/encar-crawl
+    cd /opt/encar-crawl
+    sudo -u encar python3 -m venv .venv
+    sudo -u encar .venv/bin/pip install -r requirements.txt
+    # copy .env (with DASHBOARD_PASSWORD) and var/encar.db from the old machine;
+    # chown them to encar. Without encar.db: run Import stock, then Crawl.
+
+    # Can this server's IP reach Encar? 20 cars = yes; HTTP 407 = blocked, and
+    # every crawl will fall through to the paid Bright Data route.
+    sudo -u encar .venv/bin/python main.py crawl --model bmw_3series_g20 \
+        --pages 1 --no-sold --routes api-direct
+
+    sudo cp deploy/encar-dashboard.service /etc/systemd/system/
+    sudo systemctl daemon-reload && sudo systemctl enable --now encar-dashboard
+
+    sudo a2enmod proxy proxy_http headers
+    sudo cp deploy/apache-encar.conf /etc/apache2/sites-available/encar.conf
+    # edit ServerName
+    sudo a2ensite encar && sudo systemctl reload apache2
+    sudo certbot --apache -d encar.example.com
+
+No Cloudflare software is needed on a server; `serve.sh` and
+`scripts/install-launchd.sh` are for running it from a Mac. Run it in one
+place only: two machines means two databases that drift apart.
+
+## From a Mac (Cloudflare tunnel)
 
     ./serve.sh --local                # gunicorn on http://127.0.0.1:5050 only
     ./serve.sh                        # + Cloudflare tunnel, public HTTPS URL
-    scripts/install-launchd.sh        # both, always on, plus a daily crawl
-    scripts/install-launchd.sh --models "bmw_3series_g20 benz" --at 05:30
+    scripts/install-launchd.sh        # the same, always on (restarts itself)
     scripts/install-launchd.sh --uninstall
 
-The dashboard asks for a login (`DASHBOARD_USER` / `DASHBOARD_PASSWORD` in
-`.env`); `serve.sh` will not open a tunnel without a password, and without one
-the app refuses anything that arrives through Cloudflare.
-
-Without `CLOUDFLARE_TUNNEL_TOKEN` the tunnel is a quick one: a random
-`*.trycloudflare.com` URL that changes whenever it restarts — the current one
-is in `logs/tunnel-url.txt`. For a fixed hostname, create a tunnel in the
-Cloudflare dashboard (Zero Trust → Networks → Tunnels), route its public
-hostname to `http://localhost:5050`, and put its token in `.env`.
-
-The site is up only while this Mac is awake: the LaunchAgent runs under
-`caffeinate -is`, but a closed lid still sleeps a laptop. Crawls run from the
-Mac's own IP, which is what Encar lets through.
+`serve.sh` will not open a tunnel without `DASHBOARD_PASSWORD`. Without
+`CLOUDFLARE_TUNNEL_TOKEN` the URL is a random `*.trycloudflare.com` one that
+changes on every restart (current one: `logs/tunnel-url.txt`); with a named
+tunnel from the Cloudflare dashboard, routed to `http://localhost:5050`, it is
+fixed. The site is up only while the Mac is awake.
 
 ## Tests
 

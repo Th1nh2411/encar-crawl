@@ -13,13 +13,23 @@ else is a closer look at a row of it:
     /runs             crawl history: which route delivered, what it covered,
                       whether sold detection ran -- plus the tail of the log
 
-The Crawl button spawns `main.py crawl`. One crawl at a time: this process
-refuses a second, and the crawl's lock file blocks one started elsewhere.
+    /check            live "is this plate on sale" lookup
 
-Access: with DASHBOARD_PASSWORD set in .env, every request needs HTTP Basic
-login (DASHBOARD_USER, default `admin`) -- over the tunnel that is HTTPS.
-Without it the dashboard only answers local requests: anything that arrives
-through Cloudflare is refused, so a tunnel can never expose it open by mistake.
+Everything is driven from here -- there is no scheduled crawl:
+
+    Crawl now         spawns `main.py crawl` for the chosen model
+    Import stock      spawns `main.py import-stock` (the dumps in data/)
+    Export CSV/JSON   the cars view as filtered, straight from the database
+    Check plate       live lookups, shown next to what the database says
+
+Crawl and import run as a background job, one at a time: this process refuses
+a second, and the crawl's lock file blocks one started elsewhere.
+
+Access: with DASHBOARD_PASSWORD set in .env, every request needs an HTTP
+Basic login (DASHBOARD_USER, default `admin`); serve it over HTTPS. Without a
+password the dashboard only answers direct local requests: anything that
+arrives through a proxy -- Apache, Cloudflare -- is refused, so putting it
+online without a login fails closed rather than open.
 """
 
 from __future__ import annotations
@@ -46,16 +56,18 @@ PAGE_SIZE = 50
 
 DASHBOARD_USER = os.getenv("DASHBOARD_USER") or "admin"
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD") or ""
+PROXY_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP",
+                 "CF-Connecting-IP", "Forwarded")
 
 
 @app.before_request
 def require_login():
     if not DASHBOARD_PASSWORD:
-        # cloudflared reaches the app on loopback, so the address cannot tell a
-        # tunnelled request from a local one; Cloudflare's header can.
-        if request.headers.get("CF-Connecting-IP"):
-            return Response("Set DASHBOARD_PASSWORD in .env before exposing the "
-                            "dashboard.\n", 403, mimetype="text/plain")
+        # A reverse proxy reaches the app on loopback, so the address cannot
+        # tell a proxied request from a local one; the headers it adds can.
+        if any(request.headers.get(h) for h in PROXY_HEADERS):
+            return Response("Set DASHBOARD_PASSWORD in .env before putting the "
+                            "dashboard online.\n", 403, mimetype="text/plain")
         return None
     auth = request.authorization
     if (auth and hmac.compare_digest(auth.username or "", DASHBOARD_USER)
@@ -78,12 +90,12 @@ STATUS = {
 ORDER_SQL = ("CASE status WHEN 'ON_SALE' THEN 0 WHEN 'CHECKING' THEN 1 "
              "WHEN 'SOLD' THEN 2 ELSE 3 END")
 
-# ── Crawl subprocess ──────────────────────────────────────────────────────────
+# ── Background job (crawl / import) ───────────────────────────────────────────
 _lock = threading.Lock()
-_current: Dict[str, Any] = {"proc": None, "started_at": None, "models": [], "output": []}
+_current: Dict[str, Any] = {"proc": None, "started_at": None, "label": "", "output": []}
 
 
-def crawl_state() -> Dict[str, Any]:
+def job_state() -> Dict[str, Any]:
     with _lock:
         proc = _current["proc"]
         running = proc is not None and proc.poll() is None
@@ -91,9 +103,9 @@ def crawl_state() -> Dict[str, Any]:
             "running": running,
             "startedAt": _current["started_at"].isoformat(timespec="seconds")
             if _current["started_at"] else None,
-            "models": list(_current["models"]),
+            "label": _current["label"],
             "returncode": None if running or proc is None else proc.returncode,
-            "output": list(_current["output"])[-40:],
+            "output": list(_current["output"])[-60:],
         }
 
 
@@ -107,24 +119,21 @@ def _pump(proc: subprocess.Popen) -> None:
     proc.wait()
 
 
-def start_crawl(models: List[str]) -> Tuple[bool, str]:
+def start_job(label: str, args: List[str]) -> Tuple[bool, str]:
+    """Run `main.py <args>` in the background; one job at a time."""
     with _lock:
         proc = _current["proc"]
         if proc is not None and proc.poll() is None:
-            return False, "A crawl is already running."
-        cmd = [sys.executable, os.path.join(ROOT_DIR, "main.py"), "crawl",
-               "--log-file", LOG_PATH]
-        for key in models:
-            cmd += ["--model", key]
+            return False, f"Busy: {_current['label']} is still running."
+        cmd = [sys.executable, "-u", os.path.join(ROOT_DIR, "main.py"), *args]
         try:
             proc = subprocess.Popen(cmd, cwd=ROOT_DIR, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True, bufsize=1)
         except OSError as exc:
-            return False, f"Could not start the crawler: {exc}"
-        _current.update(proc=proc, started_at=datetime.now(),
-                        models=models or ["(all models)"], output=[])
+            return False, f"Could not start: {exc}"
+        _current.update(proc=proc, started_at=datetime.now(), label=label, output=[])
     threading.Thread(target=_pump, args=(proc,), daemon=True).start()
-    return True, "Crawl started."
+    return True, f"{label} started."
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
@@ -159,30 +168,37 @@ def header() -> Dict[str, Any]:
     last = rows_of(
         "SELECT b.* FROM crawl_batches b JOIN (SELECT model_key, MAX(id) AS id "
         "FROM crawl_batches GROUP BY model_key) m ON m.id = b.id ORDER BY b.id DESC")
-    return {"last_runs": last, "models": model_options(), "crawl": crawl_state()}
+    return {"last_runs": last, "models": model_options(), "job": job_state()}
 
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
+def car_filters() -> Tuple[Dict[str, str], List[str], List[Any]]:
+    """The cars view's filters from the query string -> (filters, where, params).
+
+    `where` leaves the status out: the page counts every status under the
+    other filters, then narrows the table to the chosen one.
+    """
+    f = {k: (request.args.get(k) or "").strip()
+         for k in ("status", "model", "scope", "q", "test")}
+    base, params = ["1=1" if f["test"] == "1" else "plate_valid = 1"], []
+    if f["model"]:
+        base.append("model_key = ?")
+        params.append(f["model"])
+    if f["scope"] == "stock":
+        base.append("in_stock = 1")
+    elif f["scope"] == "encar":
+        base.append("in_stock = 0")
+    if f["q"]:
+        base.append("(plate LIKE ? OR model LIKE ?)")
+        params += [f"%{f['q']}%", f"%{f['q']}%"]
+    return f, base, params
+
+
 @app.route("/")
 def cars():
     page = page_arg()
-    status = request.args.get("status", "")
-    model = request.args.get("model", "")
-    scope = request.args.get("scope", "")
-    q = (request.args.get("q") or "").strip()
-    show_test = request.args.get("test") == "1"
-
-    base, params = ["1=1" if show_test else "plate_valid = 1"], []
-    if model:
-        base.append("model_key = ?")
-        params.append(model)
-    if scope == "stock":
-        base.append("in_stock = 1")
-    elif scope == "encar":
-        base.append("in_stock = 0")
-    if q:
-        base.append("(plate LIKE ? OR model LIKE ?)")
-        params += [f"%{q}%", f"%{q}%"]
+    filters, base, params = car_filters()
+    status = filters["status"]
 
     # The counts follow every filter but the status one, so the bar shows the
     # make-up of what is being looked at, and each segment is a filter.
@@ -212,8 +228,7 @@ def cars():
     return render_template(
         "index.html", view="cars", rows=rows, counts=counts, total=total,
         page=page, pages=max(1, math.ceil(total / PAGE_SIZE)), status_meta=STATUS,
-        filters={"status": status, "model": model, "scope": scope, "q": q,
-                 "test": "1" if show_test else ""},
+        filters=filters,
         no_plate=no_plate, hidden_test=hidden_test, **header())
 
 
@@ -262,6 +277,50 @@ def runs():
         log_tail=tail_log(), status_meta=STATUS, filters={}, **header())
 
 
+@app.route("/export.<fmt>")
+def export_cars(fmt: str):
+    """The cars view, as filtered on the page, as a download."""
+    import csv
+    import io
+
+    from .export import CAR_FIELDS, envelope
+
+    if fmt not in ("csv", "json"):
+        abort(404)
+    filters, where, params = car_filters()
+    if filters["status"] in STATUS:
+        where.append("status = ?")
+        params.append(filters["status"])
+    conn = db()
+    try:
+        rows = [dict(r) for r in conn.execute(
+            f"SELECT {', '.join(CAR_FIELDS)} FROM car_status WHERE {' AND '.join(where)} "
+            f"ORDER BY {ORDER_SQL}, plate", params)]
+    finally:
+        conn.close()
+
+    name = f"cars_{filters['model'] or 'all'}_{datetime.now():%Y%m%d_%H%M%S}"
+    if fmt == "json":
+        body = json.dumps(envelope("cars", filters["model"] or "all", rows,
+                                   {"filters": filters}), ensure_ascii=False, indent=2)
+        mimetype = "application/json"
+    else:
+        buf = io.StringIO()
+        buf.write("\ufeff")  # BOM, so Excel opens the Korean text as UTF-8
+        writer = csv.DictWriter(buf, fieldnames=list(CAR_FIELDS))
+        writer.writeheader()
+        writer.writerows(rows)
+        body, mimetype = buf.getvalue(), "text/csv"
+    return Response(body, mimetype=mimetype, headers={
+        "Content-Disposition": f'attachment; filename="{name}.{fmt}"'})
+
+
+@app.route("/check")
+def check_page():
+    return render_template("index.html", view="check", status_meta=STATUS,
+                           filters={}, **header())
+
+
 def tail_log(lines: int = 80) -> str:
     if not os.path.exists(LOG_PATH):
         return "(no log yet -- run a crawl)"
@@ -270,29 +329,80 @@ def tail_log(lines: int = 80) -> str:
 
 
 # ── API ───────────────────────────────────────────────────────────────────────
+def json_body() -> Optional[Dict[str, Any]]:
+    """The request's JSON object, or None.
+
+    Actions take JSON only: a form on another site can POST here, but a
+    cross-site JSON POST needs a CORS preflight, which this app never grants.
+    """
+    if not request.is_json:
+        return None
+    body = request.get_json(silent=True)
+    return body if isinstance(body, dict) else {}
+
+
 @app.post("/api/crawl")
 def api_crawl():
-    # JSON only. The browser sends the login with every request, so a form on
-    # another site could otherwise start a crawl; a cross-site JSON POST needs
-    # a CORS preflight, which this app never grants.
-    if not request.is_json:
+    body = json_body()
+    if body is None:
         return jsonify({"ok": False, "message": "JSON body required"}), 415
-    models = (request.get_json(silent=True) or {}).get("models")
-    models = [m for m in (models or []) if m]
+    models = [m for m in (body.get("models") or []) if m]
     # The body reaches the crawler's argv. It is passed as a list, so no shell
     # sees it, but only keys that exist in models.json belong there.
     known = {m["key"] for m in model_options()}
     unknown = [m for m in models if m not in known]
     if unknown:
         return jsonify({"ok": False, "message": f"Unknown model(s): {', '.join(unknown)}",
-                        **crawl_state()}), 400
-    ok, message = start_crawl(models)
-    return jsonify({"ok": ok, "message": message, **crawl_state()}), (200 if ok else 409)
+                        **job_state()}), 400
+
+    args = ["crawl", "--log-file", LOG_PATH]
+    for key in models:
+        args += ["--model", key]
+    label = "Crawl " + (", ".join(models) or "all models")
+    ok, message = start_job(label, args)
+    return jsonify({"ok": ok, "message": message, **job_state()}), (200 if ok else 409)
 
 
-@app.get("/api/crawl/status")
-def api_crawl_status():
-    return jsonify(crawl_state())
+@app.post("/api/import-stock")
+def api_import_stock():
+    if json_body() is None:
+        return jsonify({"ok": False, "message": "JSON body required"}), 415
+    ok, message = start_job("Import stock", ["import-stock"])
+    return jsonify({"ok": ok, "message": message, **job_state()}), (200 if ok else 409)
+
+
+@app.get("/api/job")
+def api_job():
+    return jsonify(job_state())
+
+
+CHECK_MAX = 50
+
+
+@app.post("/api/check-plate")
+def api_check_plate():
+    """Live lookups for up to CHECK_MAX plates, next to the database's view."""
+    from .plates import check_plates, normalize_plate
+
+    body = json_body()
+    if body is None:
+        return jsonify({"ok": False, "message": "JSON body required"}), 415
+    raw = body.get("plates") or []
+    if isinstance(raw, str):
+        raw = raw.replace(",", "\n").splitlines()
+    plates = list(dict.fromkeys(p for p in (normalize_plate(str(x)) for x in raw) if p))
+    if not plates:
+        return jsonify({"ok": False, "message": "No plates given"}), 400
+    if len(plates) > CHECK_MAX:
+        return jsonify({"ok": False,
+                        "message": f"At most {CHECK_MAX} plates at a time"}), 400
+
+    conn = db()
+    try:
+        results = check_plates(plates, bool(body.get("verify")), conn)
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "results": results})
 
 
 # ── Template helpers ──────────────────────────────────────────────────────────

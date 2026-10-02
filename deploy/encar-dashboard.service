@@ -1,0 +1,35 @@
+# systemd unit for the dashboard on a Linux server.
+#
+#   sudo cp deploy/encar-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now encar-dashboard
+#   journalctl -u encar-dashboard -f
+#
+# Paths assume the project in /opt/encar-crawl with a venv in .venv, run by
+# the `encar` user, which must own var/ and logs/.
+#
+# One worker on purpose: the app keeps the running job (crawl / import) in
+# memory, and a second worker would not see it. Threads give it concurrency.
+# Crawls are started from the dashboard and run as its child processes, so
+# a restart of this service stops a crawl in progress.
+
+[Unit]
+Description=Encar stock tracker dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=encar
+Group=encar
+WorkingDirectory=/opt/encar-crawl
+ExecStart=/opt/encar-crawl/.venv/bin/gunicorn \
+    --bind 127.0.0.1:5050 --workers 1 --threads 8 --timeout 180 \
+    --access-logfile - --error-logfile - \
+    encar.dashboard:app
+Restart=always
+RestartSec=5
+# A crawl can run for a long time; let it finish its current write on stop.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

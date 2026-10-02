@@ -1,0 +1,6 @@
+requests
+python-dotenv
+flask
+gunicorn
+# Only for the page-local route, which Encar currently blocks:
+# playwright
