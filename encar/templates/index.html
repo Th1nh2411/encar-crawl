@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Encar stock tracker</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #fff; --ink: #15171b; --muted: #6b7280; --faint: #9ca3af;
+    --line: #e4e7eb; --accent: #2563eb; --accent-bg: #eff4ff;
+    --ok: #047857; --ok-bg: #e9f8f1; --ok-bar: #10b981;
+    --warn: #92400e; --warn-bg: #fff7e6; --warn-bar: #f59e0b;
+    --sold: #b91c1c; --sold-bg: #fdeeee; --sold-bar: #ef4444;
+    --plain: #4b5563; --plain-bg: #f0f1f3; --plain-bar: #9ca3af;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1115; --panel: #171a21; --ink: #e8eaed; --muted: #9aa3af; --faint: #6b7280;
+      --line: #262b34; --accent: #60a5fa; --accent-bg: #172036;
+      --ok: #6ee7b7; --ok-bg: #0b2a20; --ok-bar: #34d399;
+      --warn: #fcd34d; --warn-bg: #2a220b; --warn-bar: #fbbf24;
+      --sold: #fca5a5; --sold-bg: #2c1416; --sold-bar: #f87171;
+      --plain: #c4c9d1; --plain-bg: #222731; --plain-bar: #6b7280;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 20px 16px 64px; }
+  .muted { color: var(--muted); } .faint { color: var(--faint); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* header */
+  header { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+  h1 { font-size: 18px; margin: 0; font-weight: 680; letter-spacing: -.01em; }
+  .spacer { flex: 1; }
+  select, input[type=search] { font: inherit; padding: 7px 10px; border: 1px solid var(--line);
+    border-radius: 8px; background: var(--panel); color: var(--ink); max-width: 100%; }
+  .btn { border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+    padding: 7px 14px; border-radius: 8px; cursor: pointer; font: inherit; font-weight: 560; }
+  .btn:hover { border-color: var(--accent); text-decoration: none; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn[disabled] { opacity: .55; cursor: not-allowed; }
+
+  .lastruns { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
+  .chip { display: inline-flex; gap: 6px; align-items: center; padding: 3px 10px;
+    border: 1px solid var(--line); border-radius: 999px; background: var(--panel);
+    font-size: 12px; color: var(--muted); }
+  .chip b { color: var(--ink); font-weight: 600; }
+
+  nav { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--line); }
+  nav a { padding: 8px 14px; color: var(--muted); font-weight: 580; border-bottom: 2px solid transparent;
+    margin-bottom: -1px; }
+  nav a.on { color: var(--ink); border-bottom-color: var(--accent); }
+  nav a:hover { text-decoration: none; color: var(--ink); }
+
+  /* status cards = the summary and the filter in one */
+  .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 10px; }
+  @media (max-width: 760px) { .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .card { display: block; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px 14px; color: var(--ink); border-top: 4px solid var(--bar); }
+  .card:hover { text-decoration: none; border-color: var(--bar); }
+  .card.on { box-shadow: 0 0 0 2px var(--bar) inset; }
+  .card .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .card .k { font-weight: 620; }
+  .card .ko { color: var(--muted); font-size: 12px; }
+  .card .v { font-size: 26px; font-weight: 700; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .card .s { color: var(--muted); font-size: 12px; line-height: 1.4; }
+  .t-ok { --bar: var(--ok-bar); --fg: var(--ok); --bgc: var(--ok-bg); }
+  .t-warn { --bar: var(--warn-bar); --fg: var(--warn); --bgc: var(--warn-bg); }
+  .t-sold { --bar: var(--sold-bar); --fg: var(--sold); --bgc: var(--sold-bg); }
+  .t-plain { --bar: var(--plain-bar); --fg: var(--plain); --bgc: var(--plain-bg); }
+
+  .stack { display: flex; height: 10px; border-radius: 999px; overflow: hidden; background: var(--line);
+    margin-bottom: 16px; }
+  .stack span { background: var(--bar); }
+
+  /* panels and tables */
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+    margin-bottom: 16px; }
+  .panel-hd { padding: 12px 14px; border-bottom: 1px solid var(--line); display: flex; gap: 10px;
+    align-items: center; flex-wrap: wrap; }
+  .panel-hd h2 { font-size: 14px; margin: 0; font-weight: 640; }
+  form.filters { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  form.filters input[type=search] { flex: 1 1 220px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg a { padding: 7px 12px; color: var(--muted); font-weight: 560; }
+  .seg a + a { border-left: 1px solid var(--line); }
+  .seg a.on { background: var(--accent-bg); color: var(--accent); }
+  .seg a:hover { text-decoration: none; color: var(--ink); }
+
+  .notice { padding: 10px 14px; background: var(--warn-bg); color: var(--warn); font-size: 13px;
+    border-bottom: 1px solid var(--line); }
+  .notice a { color: inherit; text-decoration: underline; }
+
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em;
+    background: var(--panel); }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover td { background: var(--bg); }
+  td.wrap-cell { white-space: normal; min-width: 220px; }
+  .plate { font-weight: 650; font-size: 13.5px; }
+
+  .pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; background: var(--bgc); color: var(--fg); }
+  .pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--bar); }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 6px; font-size: 11.5px; font-weight: 600;
+    background: var(--plain-bg); color: var(--plain); }
+  .tag.stock { background: var(--accent-bg); color: var(--accent); }
+
+  .ads { display: inline-flex; gap: 2px; vertical-align: middle; }
+  .ads i { width: 8px; height: 14px; border-radius: 2px; background: var(--line); }
+  .ads i.live { background: var(--ok-bar); }
+
+  .cov { display: inline-block; width: 70px; height: 6px; border-radius: 999px; background: var(--line);
+    vertical-align: middle; overflow: hidden; margin-right: 6px; }
+  .cov span { display: block; height: 100%; background: var(--bar); }
+
+  .pager { display: flex; gap: 10px; align-items: center; padding: 12px 14px; }
+  .empty { padding: 40px 14px; text-align: center; color: var(--muted); }
+
+  /* one car */
+  .car-hd { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 16px 14px; }
+  .car-hd .plate { font-size: 24px; letter-spacing: -.01em; }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    border-top: 1px solid var(--line); }
+  .facts > div { padding: 10px 14px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .facts .k { color: var(--muted); font-size: 12px; }
+  .facts .v { font-weight: 600; }
+  ol.timeline { list-style: none; margin: 0; padding: 12px 14px; }
+  ol.timeline li { position: relative; padding: 0 0 12px 22px; }
+  ol.timeline li::before { content: ""; position: absolute; left: 4px; top: 6px; width: 8px; height: 8px;
+    border-radius: 50%; background: var(--bar, var(--accent)); }
+  ol.timeline li::after { content: ""; position: absolute; left: 7px; top: 16px; bottom: 0; width: 2px;
+    background: var(--line); }
+  ol.timeline li:last-child::after { display: none; }
+
+  pre.log { margin: 0; padding: 12px 14px; background: var(--bg); color: var(--muted);
+    font: 11.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; max-height: 340px; overflow: auto; }
+  #runbox { display: none; } #runbox.on { display: block; }
+  #runout { margin: 0; padding: 12px 14px; background: var(--bg); max-height: 220px; overflow: auto;
+    white-space: pre-wrap; font: 11.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block;
+    animation: pulse 1.1s infinite; }
+  @keyframes pulse { 50% { opacity: .25; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  {# ── Header: crawl control + the last run of every model ─────────────── #}
+  <header>
+    <h1>Encar stock tracker</h1>
+    <span class="spacer"></span>
+    <select id="crawlmodel" aria-label="Model to crawl">
+      <option value="">All models</option>
+      {% for m in models %}<option value="{{ m.key }}">{{ m.label }}</option>{% endfor %}
+    </select>
+    <button class="btn primary" id="crawlbtn">Crawl now</button>
+  </header>
+
+  <div class="lastruns">
+    {% for r in last_runs %}
+      {% set tone = {'OK':'ok','PARTIAL':'warn','FAILED':'sold'}.get(r.status, 'plain') %}
+      <span class="chip t-{{ tone }}" title="{{ r.note or '' }}">
+        <span class="pill">{{ r.status }}</span><b>{{ r.model_key }}</b>
+        {{ r.route or '—' }} · {{ r.started_at|ago }}
+      </span>
+    {% else %}
+      <span class="chip">No crawl yet — pick a model and hit “Crawl now”.</span>
+    {% endfor %}
+  </div>
+
+  <div class="panel" id="runbox">
+    <div class="panel-hd"><span class="dot"></span><h2 id="runtitle">Crawling…</h2></div>
+    <pre id="runout"></pre>
+  </div>
+
+  <nav>
+    <a href="/" class="{{ 'on' if view in ('cars', 'car') }}">Cars</a>
+    <a href="/runs" class="{{ 'on' if view == 'runs' }}">Crawl runs</a>
+  </nav>
+
+{% if view == 'cars' %}
+  {# ── Cars: one row per plate, from car_status ───────────────────────── #}
+  {% set grand = counts.values()|sum %}
+  <div class="cards">
+    {% for key, meta in status_meta.items() %}
+      <a class="card t-{{ meta.tone }} {{ 'on' if filters.status == key }}"
+         href="{{ url_with(status=None if filters.status == key else key) }}">
+        <div class="top"><span class="k">{{ meta.en }}</span><span class="ko">{{ meta.ko }}</span></div>
+        <div class="v">{{ counts[key]|num }}</div>
+        <div class="s">{{ meta.help }}</div>
+      </a>
+    {% endfor %}
+  </div>
+  {% if grand %}
+  <div class="stack" title="Share of each status">
+    {% for key, meta in status_meta.items() if counts[key] %}
+      <span class="t-{{ meta.tone }}" style="width: {{ 100 * counts[key] / grand }}%"
+            title="{{ meta.en }}: {{ counts[key] }}"></span>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <div class="panel">
+    <form class="filters" method="get">
+      <input type="search" name="q" value="{{ filters.q }}" placeholder="Plate or model…">
+      <select name="model" onchange="this.form.submit()">
+        <option value="">All models</option>
+        {% for m in models %}
+          <option value="{{ m.key }}" {{ 'selected' if filters.model == m.key }}>{{ m.label }}</option>
+        {% endfor %}
+      </select>
+      <span class="seg">
+        <a href="{{ url_with(scope=None) }}" class="{{ 'on' if not filters.scope }}">All</a>
+        <a href="{{ url_with(scope='stock') }}" class="{{ 'on' if filters.scope == 'stock' }}">In our stock</a>
+        <a href="{{ url_with(scope='encar') }}" class="{{ 'on' if filters.scope == 'encar' }}">Encar only</a>
+      </span>
+      {% for k in ('status', 'scope', 'test') if filters[k] %}
+        <input type="hidden" name="{{ k }}" value="{{ filters[k] }}">
+      {% endfor %}
+      <button class="btn">Search</button>
+      {% if filters.q or filters.model or filters.scope or filters.status %}
+        <a class="btn" href="/">Clear</a>
+      {% endif %}
+    </form>
+
+    {% if no_plate or hidden_test %}
+    <div class="notice">
+      {% if no_plate %}{{ no_plate }} Encar ad(s) have no plate yet (detail lookup pending) and are not counted. {% endif %}
+      {% if hidden_test %}
+        {% if filters.test %}<a href="{{ url_with(test=None) }}">Hide {{ hidden_test }} test rows</a>
+        {% else %}{{ hidden_test }} stock row(s) with a placeholder plate are hidden —
+          <a href="{{ url_with(test='1') }}">show</a>.{% endif %}
+      {% endif %}
+    </div>
+    {% endif %}
+
+    <div class="scroll">
+    {% if not rows %}
+      <div class="empty">Nothing here yet. Run a crawl, or <code>python main.py import-stock</code> for the stock list.</div>
+    {% else %}
+      <table>
+        <thead><tr>
+          <th>Plate</th><th>Status</th><th>Model</th><th class="num">Year</th>
+          <th class="num">Mileage</th><th class="num">Encar price (만원)</th>
+          <th>Ads live</th><th>Stock</th><th>Last seen</th>
+        </tr></thead>
+        <tbody>
+        {% for r in rows %}
+          {% set meta = status_meta[r.status] %}
+          <tr>
+            <td class="plate"><a href="/car/{{ r.plate|urlencode }}">{{ r.plate }}</a></td>
+            <td>
+              <span class="pill t-{{ meta.tone }}">{{ meta.en }} · {{ meta.ko }}</span>
+              {% if r.status == 'CHECKING' %}<span class="faint">missed ×{{ r.missing_streak }}</span>{% endif %}
+            </td>
+            <td class="wrap-cell">{{ r.model or '—' }}</td>
+            <td class="num muted">{{ r.year or '—' }}</td>
+            <td class="num">{{ r.mileage|num }}</td>
+            <td class="num">
+              {% if r.min_price and r.max_price and r.min_price != r.max_price %}{{ r.min_price|num }}–{{ r.max_price|num }}
+              {% else %}{{ r.min_price|num }}{% endif %}
+            </td>
+            <td>
+              {% if r.listings %}
+                <span class="ads" title="{{ r.active_listings }} of {{ r.listings }} ads live">
+                  {% for i in range([r.listings, 8]|min) %}<i class="{{ 'live' if i < r.active_listings }}"></i>{% endfor %}
+                </span>
+                <span class="muted">{{ r.active_listings }}/{{ r.listings }}</span>
+              {% else %}<span class="faint">—</span>{% endif %}
+            </td>
+            <td>{% if r.in_stock %}<span class="tag stock">in stock</span>{% else %}<span class="faint">—</span>{% endif %}</td>
+            <td class="muted">{{ r.last_seen_at|ago }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+    </div>
+
+    {% if pages > 1 %}
+    <div class="pager">
+      {% if page > 1 %}<a class="btn" href="{{ url_with(page=page - 1) }}">← Prev</a>{% endif %}
+      <span class="muted">Page {{ page }} of {{ pages }} · {{ total|num }} cars</span>
+      {% if page < pages %}<a class="btn" href="{{ url_with(page=page + 1) }}">Next →</a>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+{% elif view == 'car' %}
+  {# ── One car ──────────────────────────────────────────────────────────── #}
+  {% set meta = status_meta[car.status] %}
+  <p><a href="/">← All cars</a></p>
+  <div class="panel t-{{ meta.tone }}">
+    <div class="car-hd">
+      <span class="plate">{{ car.plate }}</span>
+      <span class="pill">{{ meta.en }} · {{ meta.ko }}</span>
+      {% if car.in_stock %}<span class="tag stock">in our stock</span>{% endif %}
+      <span class="muted">{{ meta.help }}</span>
+    </div>
+    <div class="facts">
+      <div><div class="k">Model</div><div class="v">{{ car.model or '—' }}</div></div>
+      <div><div class="k">Year</div><div class="v">{{ car.year or '—' }}</div></div>
+      <div><div class="k">Mileage</div><div class="v">{{ car.mileage|num }} km</div></div>
+      <div><div class="k">Colour</div><div class="v">{{ car.color_name or '—' }}</div></div>
+      <div><div class="k">Encar price (만원)</div><div class="v">
+        {% if car.min_price and car.max_price and car.min_price != car.max_price %}{{ car.min_price|num }}–{{ car.max_price|num }}
+        {% else %}{{ car.min_price|num }}{% endif %}</div></div>
+      <div><div class="k">Ads live</div><div class="v">{{ car.active_listings }} / {{ car.listings }}</div></div>
+    </div>
+    <ol class="timeline">
+      {% if car.first_seen_at %}<li class="t-ok">First seen on Encar <span class="muted">{{ car.first_seen_at }} ({{ car.first_seen_at|ago }})</span></li>{% endif %}
+      {% if car.last_seen_at %}<li class="t-ok">Last seen on Encar <span class="muted">{{ car.last_seen_at }} ({{ car.last_seen_at|ago }})</span></li>{% endif %}
+      {% if car.status == 'CHECKING' %}<li class="t-warn">Missing from the latest {{ car.missing_streak }} crawl(s) — waiting for confirmation</li>{% endif %}
+      {% if car.sold_detected_at and car.status == 'SOLD' %}<li class="t-sold">Marked sold <span class="muted">{{ car.sold_detected_at }} ({{ car.sold_detected_at|ago }})</span></li>{% endif %}
+      {% if car.status == 'NOT_FOUND' %}<li class="t-plain">Never seen in any crawl — add its model to <code>models.json</code></li>{% endif %}
+    </ol>
+  </div>
+
+  <div class="panel">
+    <div class="panel-hd"><h2>Encar ads</h2><span class="muted">One car is often posted by several dealers.</span></div>
+    <div class="scroll">
+    {% if ads %}
+      <table>
+        <thead><tr><th>Ad</th><th>Status</th><th class="num">Price (만원)</th><th class="num">Mileage</th>
+          <th>Model</th><th>Model key</th><th>First seen</th><th>Last seen</th></tr></thead>
+        <tbody>
+        {% for a in ads %}
+          {% set tone = 'sold' if a.status == 'SOLD' else ('warn' if a.missing_streak else 'ok') %}
+          <tr>
+            <td><a href="https://fem.encar.com/cars/detail/{{ a.car_id }}" target="_blank" rel="noopener">#{{ a.car_id }} ↗</a>
+              {% if a.is_duplicate %}<span class="tag">repost</span>{% endif %}</td>
+            <td><span class="pill t-{{ tone }}">{{ 'Gone' if a.status == 'SOLD' else ('Missed ×' ~ a.missing_streak if a.missing_streak else 'Live') }}</span></td>
+            <td class="num">{{ a.price|num }}</td>
+            <td class="num">{{ a.mileage|num }}</td>
+            <td class="wrap-cell">{{ a.model_info or '—' }}</td>
+            <td class="muted">{{ a.model_key }}</td>
+            <td class="muted">{{ a.first_seen_at|ago }}</td>
+            <td class="muted">{{ a.last_seen_at|ago }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}<div class="empty">No Encar ad has carried this plate.</div>{% endif %}
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-hd"><h2>Stock record</h2><span class="muted">sonokong <code>rent_product</code></span></div>
+    <div class="scroll">
+    {% if stock %}
+      <table>
+        <thead><tr><th>Product</th><th>Model</th><th>Made</th><th class="num">Mileage</th>
+          <th class="num">Purchase price (₩)</th><th>Fuel</th><th>Colour</th><th>Rental state</th></tr></thead>
+        <tbody>
+        {% for s in stock %}
+          <tr>
+            <td class="muted">#{{ s.product_id }}</td>
+            <td class="wrap-cell">{{ s.model_name or '—' }}</td>
+            <td class="muted">{{ (s.car_manufacture_date or '')[:10] or '—' }}</td>
+            <td class="num">{{ s.mileage|num }}</td>
+            <td class="num">{{ s.purchase_price|num }}</td>
+            <td>{{ s.car_fuel or '—' }}</td>
+            <td>{{ s.ex_color or '—' }}</td>
+            <td><span class="tag">{{ s.car_status or '—' }}</span></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}<div class="empty">Not in our stock.</div>{% endif %}
+    </div>
+  </div>
+
+{% else %}
+  {# ── Crawl runs ───────────────────────────────────────────────────────── #}
+  {% set parked = routes|selectattr('left')|list %}
+  {% if parked %}
+  <div class="panel">
+    <div class="panel-hd"><h2>Routes on hold</h2><span class="muted">Skipped until the time is up; the crawl falls through to the next route.</span></div>
+    <div class="scroll"><table>
+      <thead><tr><th>Route</th><th>Why</th><th>Back in</th></tr></thead>
+      <tbody>{% for r in parked %}
+        <tr><td><b>{{ r.route }}</b></td><td>{{ r.why }}</td>
+          <td class="muted">{{ (r.left / 3600)|round(1) ~ 'h' if r.left > 3600 else (r.left|int ~ 's') }}</td></tr>
+      {% endfor %}</tbody>
+    </table></div>
+  </div>
+  {% endif %}
+
+  <div class="panel">
+    <div class="panel-hd"><h2>Crawl runs</h2>
+      <span class="muted">One per model per crawl. Sold detection only runs on an OK run that covered every page.</span></div>
+    <div class="scroll">
+    {% if not rows %}<div class="empty">No crawl yet.</div>{% else %}
+      <table>
+        <thead><tr><th>#</th><th>Model</th><th>Started</th><th class="num">Took</th><th>Result</th>
+          <th>Route</th><th>Coverage</th><th class="num">Cars</th><th class="num">Plates</th>
+          <th>Sold check</th><th>Note</th></tr></thead>
+        <tbody>
+        {% for r in rows %}
+          {% set tone = {'OK':'ok','PARTIAL':'warn','FAILED':'sold'}.get(r.status, 'plain') %}
+          <tr>
+            <td class="muted">{{ r.id }}</td>
+            <td><b>{{ r.model_key }}</b></td>
+            <td class="muted" title="{{ r.started_at }}">{{ r.started_at|ago }}</td>
+            <td class="num">{{ r.duration_s|dur }}</td>
+            <td><span class="pill t-{{ tone }}">{{ r.status }}</span></td>
+            <td title="{% for a in r.attempts %}{{ a.route }}: {{ a.result }}&#10;{% endfor %}">
+              {{ r.route or '—' }}
+              {% set tried = r.attempts|rejectattr('result', 'equalto', 'ok')|list %}
+              {% if tried %}<span class="faint">after {{ tried|length }} fallback(s)</span>{% endif %}
+            </td>
+            <td>
+              {% if r.pages_requested %}
+                <span class="cov t-{{ tone }}"><span style="width: {{ 100 * (r.pages_fetched or 0) / r.pages_requested }}%"></span></span>
+                <span class="muted">{{ r.pages_fetched }}/{{ r.pages_requested }} pages{% if not r.every_page %} (subset){% endif %}</span>
+              {% else %}<span class="faint">—</span>{% endif %}
+            </td>
+            <td class="num">{{ r.crawled_count|num }}{% if r.listing_total %}<span class="faint"> / {{ r.listing_total|num }}</span>{% endif %}</td>
+            <td class="num">{{ r.vehicle_no_filled|num }}</td>
+            <td>{% if r.sold_checked %}{{ r.missing_count }} missing · <b>{{ r.sold_marked_count }} sold</b>
+                {% else %}<span class="faint">skipped</span>{% endif %}</td>
+            <td class="wrap-cell muted">{{ r.note or '' }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+    </div>
+    {% if pages > 1 %}
+    <div class="pager">
+      {% if page > 1 %}<a class="btn" href="{{ url_with(page=page - 1) }}">← Prev</a>{% endif %}
+      <span class="muted">Page {{ page }} of {{ pages }}</span>
+      {% if page < pages %}<a class="btn" href="{{ url_with(page=page + 1) }}">Next →</a>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <div class="panel-hd"><h2>Recent log</h2><span class="muted mono">logs/encar.log</span></div>
+    <pre class="log">{{ log_tail }}</pre>
+  </div>
+{% endif %}
+
+</div>
+
+<script>
+const btn = document.getElementById('crawlbtn');
+const box = document.getElementById('runbox');
+const out = document.getElementById('runout');
+const title = document.getElementById('runtitle');
+const dot = document.querySelector('#runbox .dot');
+let polling = null;
+// Reload only on a running -> finished transition this page actually saw.
+let sawRunning = false;
+
+function render(state, message) {
+  if (state.running || (state.output && state.output.length)) box.classList.add('on');
+  btn.disabled = !!state.running;
+  btn.textContent = state.running ? 'Crawling…' : 'Crawl now';
+  if (state.running) {
+    dot.style.display = '';
+    title.textContent = 'Crawling ' + (state.models.join(', ') || 'all models') +
+                        ' — started ' + (state.startedAt || '').replace('T', ' ');
+  } else if (state.returncode !== null && state.returncode !== undefined) {
+    const codes = {0: 'Done', 1: 'A model failed', 2: 'Another crawl is already running'};
+    title.textContent = codes[state.returncode] || ('Finished (exit ' + state.returncode + ')');
+    dot.style.display = 'none';
+  }
+  const lines = (state.output || []).join('\n');
+  out.textContent = message ? message + '\n' + lines : lines;
+  out.scrollTop = out.scrollHeight;
+}
+
+async function poll() {
+  const state = await (await fetch('/api/crawl/status')).json();
+  render(state);
+  if (state.running) {
+    sawRunning = true;
+    if (!polling) polling = setInterval(poll, 1500);
+    return;
+  }
+  if (polling) { clearInterval(polling); polling = null; }
+  if (sawRunning) { sawRunning = false; setTimeout(() => location.reload(), 1200); }
+}
+
+btn.addEventListener('click', async () => {
+  const model = document.getElementById('crawlmodel').value;
+  btn.disabled = true;
+  const r = await fetch('/api/crawl', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({models: model ? [model] : []}),
+  });
+  const data = await r.json();
+  render(data, data.message);
+  if (!polling) polling = setInterval(poll, 1500);
+});
+
+poll();
+</script>
+</body>
+</html>

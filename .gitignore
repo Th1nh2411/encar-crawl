@@ -14,14 +14,13 @@ venv/
 .pytest_cache/
 .ruff_cache/
 
-# Run artefacts: output/<tool>/<name>_<timestamp>.{json,csv} and the run log
+# Exports (output/<view>/<name>_<timestamp>.{json,csv}) and the run log
 output/
 logs/
 *.log
 
-# State the next run reads: the plate cache and the throttle memory. Separate
-# from output/ because these are not results — deleting the cache costs
-# thousands of requests to rebuild it.
+# The database (var/encar.db) and the crawl lock. Separate from output/
+# because this is the data itself, not an export of it — back it up.
 var/
 
 # Ad-hoc exports that predate output/

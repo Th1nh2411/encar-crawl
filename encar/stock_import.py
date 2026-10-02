@@ -1,6 +1,6 @@
 """
-import_rent_stock.py — Load the sonokong `product_group` and `rent_product`
-dumps into MySQL.
+stock_import.py — Load the sonokong `product_group` and `rent_product` dumps
+from data/ into the database.
 
 Both dumps are data-only: `INSERT INTO <table> VALUES (...)` with no column
 list and no CREATE TABLE. The matching `.sch` files carry the real schema, so
@@ -17,23 +17,25 @@ dashboard's queries flat.
 Only live stock is imported (`is_del = 0`) — a soft-deleted car is out of
 inventory, so whether Encar still lists it is not a question worth asking.
 
-    python stock_pipeline/migrate.py
-    python stock_pipeline/import_rent_stock.py
-    python stock_pipeline/import_rent_stock.py --all      # include is_del = 1
-    python stock_pipeline/import_rent_stock.py --dry-run
+    python main.py import-stock
+    python main.py import-stock --all        # include is_del = 1
+    python main.py import-stock --dry-run
 """
 
-import argparse
+from __future__ import annotations
+
 import gzip
 import os
 import re
-import sys
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import MIGRATIONS_DIR
-from db import connect
-from run_log import log
+from . import store
+from .log import log
+
+# A real Korean plate: 12가3456 / 123가4567. 21 live rows carry QA placeholders
+# ('test 0101', 'For Test 02', '1') instead; they can never match Encar, so
+# they are flagged at import and hidden by default.
+PLATE_RE = re.compile(r"^[0-9]{2,3}[가-힣][0-9]{4}$")
 
 TUPLE_RE = re.compile(r"\((.*?)\)(?=,\(|$)", re.S)
 COL_RE = re.compile(r"^\s*`([A-Za-z0-9_]+)`\s", re.M)
@@ -187,14 +189,6 @@ def build_paths(groups: List[Dict[str, Any]]) -> Dict[int, str]:
     return {gid: path(gid) for gid in by_id}
 
 
-def insert_many(cur, table: str, cols: List[str], rows: List[Dict[str, Any]]) -> None:
-    placeholders = ", ".join(f"%({c})s" for c in cols)
-    names = ", ".join(f"`{c}`" for c in cols)
-    sql = f"INSERT INTO {table} ({names}) VALUES ({placeholders})"
-    for i in range(0, len(rows), 500):
-        cur.executemany(sql, rows[i:i + 500])
-
-
 def load_table(dump: str, sch: str, table: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     columns = schema_columns(sch, table)
     log(f"  {table}: {len(columns)} column(s) in {os.path.basename(sch)}")
@@ -203,17 +197,11 @@ def load_table(dump: str, sch: str, table: str) -> Tuple[List[Dict[str, Any]], L
     return rows, columns
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Import the sonokong product_group and rent_product dumps.")
-    parser.add_argument("--dir", default=MIGRATIONS_DIR, help="Where the .sql.gz and .sch files live")
-    parser.add_argument("--all", action="store_true",
-                        help="Import soft-deleted stock too (default: is_del = 0 only)")
-    parser.add_argument("--dry-run", action="store_true", help="Parse and report, write nothing")
-    args = parser.parse_args()
-
-    paths = {name: (os.path.join(args.dir, f"{name}.sql.gz"),
-                    os.path.join(args.dir, f"{name}.sch"))
+def import_stock(conn, data_dir: str, include_deleted: bool = False,
+                 dry_run: bool = False) -> int:
+    """Parse both dumps and replace the stock tables. Returns rows imported."""
+    paths = {name: (os.path.join(data_dir, f"{name}.sql.gz"),
+                    os.path.join(data_dir, f"{name}.sch"))
              for name in ("product_group", "rent_product")}
     for name, (dump, sch) in paths.items():
         for p in (dump, sch):
@@ -227,64 +215,47 @@ def main() -> int:
     groups = [{dst: coerce(dst, r.get(src)) for src, dst in PRODUCT_GROUP_COLS.items()}
               for r in pg_rows]
     paths_by_group = build_paths(groups)
-    log(f"  product_group: {len(paths_by_group)} path(s) built, "
-        f"max depth label e.g. {next(iter(sorted(paths_by_group.values(), key=len, reverse=True)), '')[:60]!r}")
+    log(f"  product_group: {len(paths_by_group)} path(s) built")
 
-    now = datetime.now()
+    now = store.now()
     products: List[Dict[str, Any]] = []
     skipped_deleted = 0
     for r in rp_rows:
-        if not args.all and (r.get("is_del") or "0") != "0":
+        if not include_deleted and (r.get("is_del") or "0") != "0":
             skipped_deleted += 1
             continue
         row = {dst: coerce(dst, r.get(src)) for src, dst in RENT_PRODUCT_COLS.items()}
-        if not row.get("car_number"):
+        if not row.get("car_number") or row.get("product_id") is None:
             continue
-        row["model_name"] = paths_by_group.get(row.get("group_id")) or None
+        row["car_number"] = str(row["car_number"]).strip()
+        row["plate_valid"] = 1 if PLATE_RE.match(row["car_number"]) else 0
+        group_id = row.get("group_id")
+        row["model_name"] = paths_by_group.get(group_id) if group_id is not None else None
         row["imported_at"] = now
         products.append(row)
 
     log(f"  rent_product: {len(products)} live row(s), {skipped_deleted} soft-deleted skipped")
     unnamed = sum(1 for p in products if not p["model_name"])
     if unnamed:
-        log(f"  ! {unnamed} row(s) have no product_group match — model_name left NULL")
+        log(f"  ! {unnamed} row(s) have no product_group match — model_name left empty")
 
-    if args.dry_run:
+    if dry_run:
         for p in products[:5]:
             log(f"    {p['car_number']} | {p['model_name']} | "
                 f"{p['car_manufacture_date']} | {p['mileage']}km | {p['purchase_price']}")
         log("dry-run: nothing written")
         return 0
 
-    group_cols = list(PRODUCT_GROUP_COLS.values())
-    product_cols = list(RENT_PRODUCT_COLS.values()) + ["model_name", "imported_at"]
-    product_cols.remove("product_id")
-    product_cols.insert(0, "product_id")
+    store.replace_stock(conn, groups, products)
+    log(f"\nImported {len(groups)} product_group row(s) "
+        f"and {len(products)} rent_product row(s).")
 
-    conn = connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM product_group")
-            insert_many(cur, "product_group", group_cols, groups)
-            cur.execute("DELETE FROM rent_product")
-            insert_many(cur, "rent_product", product_cols, products)
-        conn.commit()
-        log(f"\nImported {len(groups)} product_group row(s) "
-            f"and {len(products)} rent_product row(s).")
-
-        with conn.cursor() as cur:
-            cur.execute("SELECT status, COUNT(*) FROM stock_status GROUP BY status")
-            summary = dict(cur.fetchall())
-        log("\nStock status:")
-        for key, label in (("ON_SALE", "판매중"), ("SOLD_OUT", "판매완료"), ("UNKNOWN", "미확인")):
-            log(f"  {label:<10} {summary.get(key, 0)}")
-        if summary.get("UNKNOWN"):
-            log("\n  미확인 = the plate has never appeared in a crawl. Add these cars' "
-                "models to models.json and crawl before reading them as sold.")
-    finally:
-        conn.close()
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    counts = store.status_counts(conn, "in_stock = 1 AND plate_valid = 1")
+    log("\nStock against Encar:")
+    for key, label in (("ON_SALE", "판매중"), ("CHECKING", "확인중"),
+                       ("SOLD", "판매완료"), ("NOT_FOUND", "미확인")):
+        log(f"  {label:<8} {counts.get(key, 0)}")
+    if counts.get("NOT_FOUND"):
+        log("\n  미확인 = the plate has never appeared in a crawl. Add these cars' "
+            "models to models.json and crawl before reading them as sold.")
+    return len(products)

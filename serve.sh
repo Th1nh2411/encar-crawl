@@ -1,88 +1,123 @@
 #!/usr/bin/env bash
 #
-# serve.sh — Run the dashboard behind gunicorn and expose it through a
-# Cloudflare quick tunnel.
+# serve.sh — Run the dashboard behind gunicorn and put it online through a
+# Cloudflare tunnel.
 #
-#   ./serve.sh            # gunicorn on 127.0.0.1:$UI_PORT + public tunnel URL
+#   ./serve.sh            # gunicorn on 127.0.0.1:$UI_PORT + public tunnel
 #   ./serve.sh --local    # gunicorn only, no tunnel
 #
-# The app keeps the crawl subprocess state in memory, so it MUST run as a
-# single worker. Threads (not workers) give it the concurrency it needs to
-# serve status polls while a crawl is running -- a second worker would have its
-# own empty state and report "no crawl running" at random.
+# Two kinds of tunnel, picked from .env:
 #
-# The tunnel reaches gunicorn on loopback, so the app itself is never bound to
-# a public interface. Anyone with the URL can use it, including the Crawl
-# button: that is deliberate here, and it is why the URL should be treated as
-# a secret. Ctrl-C stops both processes and the public URL dies with them.
+#   CLOUDFLARE_TUNNEL_TOKEN set   a named tunnel: a fixed hostname you own,
+#                                 configured in the Cloudflare dashboard
+#                                 (Zero Trust -> Networks -> Tunnels; route the
+#                                 public hostname to http://localhost:5050)
+#   not set                       a quick tunnel: a random *.trycloudflare.com
+#                                 URL that changes on every start. Written to
+#                                 logs/tunnel-url.txt so it can be found.
+#
+# The tunnel refuses to open without DASHBOARD_PASSWORD: the dashboard would
+# be public, and its Crawl button can spend Bright Data credit.
+#
+# The app keeps the crawl subprocess state in memory, so it MUST run as a
+# single worker; threads give it the concurrency to serve status polls while a
+# crawl runs. If either process dies the script exits non-zero, so launchd
+# (scripts/install-launchd.sh) restarts both together.
 
 set -euo pipefail
-# dashboard.py lives in stock_pipeline/ together with its templates/, and
-# gunicorn resolves "dashboard:app" against the working directory. The app
-# anchors its data paths on the project root, so it does not care where it is
-# started from.
-cd "$(dirname "$0")/stock_pipeline"
+# gunicorn resolves "encar.dashboard:app" against the working directory.
+cd "$(dirname "$0")"
 
-PORT="${UI_PORT:-5050}"
-WORKERS=1
+# .env is read by Python, which already knows its quoting rules.
+env_value() {
+    python3 -c "import os, encar.config; print(os.getenv('$1') or '')" 2>/dev/null
+}
+
+PORT="${UI_PORT:-$(env_value UI_PORT)}"
+PORT="${PORT:-5050}"
 THREADS="${UI_THREADS:-8}"
-TIMEOUT="${UI_TIMEOUT:-180}"   # a crawl request returns fast, but be generous
+TIMEOUT="${UI_TIMEOUT:-180}"
+URL_FILE="logs/tunnel-url.txt"
+mkdir -p logs
 
-command -v cloudflared >/dev/null 2>&1 || CLOUDFLARED_MISSING=1
+MODE="${1:-tunnel}"
+if [ "$MODE" != "--local" ]; then
+    if [ -z "$(env_value DASHBOARD_PASSWORD)" ]; then
+        echo "DASHBOARD_PASSWORD is not set in .env — refusing to put the dashboard" >&2
+        echo "online without a login. Set it, or run ./serve.sh --local." >&2
+        exit 1
+    fi
+    command -v cloudflared >/dev/null 2>&1 || {
+        echo "cloudflared not installed (brew install cloudflared)" >&2; exit 1; }
+fi
 
 # gunicorn only warns and retries when the port is taken, so the tunnel would
 # come up pointing at whatever else is listening. Refuse instead.
 if lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "Port ${PORT} is already in use:" >&2
     lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN >&2
-    echo "Stop it first, or set UI_PORT to another port." >&2
     exit 1
 fi
 
-echo "Starting gunicorn on 127.0.0.1:${PORT} (${WORKERS} worker, ${THREADS} threads)"
+echo "Starting gunicorn on 127.0.0.1:${PORT} (1 worker, ${THREADS} threads)"
 python3 -m gunicorn \
     --bind "127.0.0.1:${PORT}" \
-    --workers "${WORKERS}" \
+    --workers 1 \
     --threads "${THREADS}" \
     --timeout "${TIMEOUT}" \
     --access-logfile - \
     --error-logfile - \
-    dashboard:app &
+    encar.dashboard:app &
 GUNICORN_PID=$!
+TUNNEL_PID=""
 
 cleanup() {
-    echo
-    echo "Shutting down..."
-    [ -n "${TUNNEL_PID:-}" ] && kill "${TUNNEL_PID}" 2>/dev/null || true
+    [ -n "${TUNNEL_PID}" ] && kill "${TUNNEL_PID}" 2>/dev/null || true
     kill "${GUNICORN_PID}" 2>/dev/null || true
     wait 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-# Wait for it to actually answer, not merely to have been spawned.
+# Wait for it to answer (401 counts: it is up, it just wants a login).
 for _ in $(seq 1 20); do
-    if curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/api/crawl/status" 2>/dev/null; then
-        break
-    fi
+    code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/api/crawl/status" || true)"
+    [ "$code" = "200" ] || [ "$code" = "401" ] && break
     kill -0 "${GUNICORN_PID}" 2>/dev/null || { echo "gunicorn died on startup" >&2; exit 1; }
     sleep 1
 done
 echo "Local:  http://127.0.0.1:${PORT}"
 
-if [ "${1:-}" = "--local" ]; then
+if [ "$MODE" = "--local" ]; then
     wait "${GUNICORN_PID}"
-    exit 0
+    exit $?
 fi
 
-if [ -n "${CLOUDFLARED_MISSING:-}" ]; then
-    echo "cloudflared not installed - running locally only (brew install cloudflared)" >&2
-    wait "${GUNICORN_PID}"
-    exit 0
+TOKEN="$(env_value CLOUDFLARE_TUNNEL_TOKEN)"
+if [ -n "$TOKEN" ]; then
+    echo "Opening the named Cloudflare tunnel (hostname set in the Cloudflare dashboard)"
+    echo "named tunnel — see the Cloudflare dashboard for the hostname" > "$URL_FILE"
+    TUNNEL_TOKEN="$TOKEN" cloudflared tunnel --no-autoupdate run &
+    TUNNEL_PID=$!
+else
+    echo "Opening a quick tunnel (URL changes on every start)"
+    : > "$URL_FILE"
+    # Into a file rather than a pipe, so $! is cloudflared itself and the
+    # cleanup above can stop it.
+    cloudflared tunnel --url "http://127.0.0.1:${PORT}" --no-autoupdate \
+        > logs/tunnel.log 2>&1 &
+    TUNNEL_PID=$!
 fi
 
-echo "Opening Cloudflare tunnel..."
-cloudflared tunnel --url "http://127.0.0.1:${PORT}" --no-autoupdate 2>&1 |
-    tee /tmp/encar-tunnel.log &
-TUNNEL_PID=$!
-
-wait "${GUNICORN_PID}"
+# bash 3.2 has no `wait -n`: poll, and leave as soon as either side is gone.
+while kill -0 "${GUNICORN_PID}" 2>/dev/null && kill -0 "${TUNNEL_PID}" 2>/dev/null; do
+    if [ ! -s "$URL_FILE" ]; then
+        url="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' logs/tunnel.log 2>/dev/null | head -1 || true)"
+        if [ -n "$url" ]; then
+            echo "$url" > "$URL_FILE"
+            echo "Public: $url   (also in $URL_FILE)"
+        fi
+    fi
+    sleep 2
+done
+echo "A process exited — stopping so the supervisor can restart both" >&2
+exit 1

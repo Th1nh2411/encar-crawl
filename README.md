@@ -1,138 +1,167 @@
 # Encar crawling
 
-    python main.py            # every page of the model, by whatever route works
+One crawler, one database. Every way of reading Encar — its JSON API from this
+host or through a proxy service, a local browser, the hosted Bright Data
+collector — reads the same listings and the same vehicle numbers. They are
+routes to one result, not separate tools, so they share one row shape and land
+in one SQLite file, `var/encar.db`. The dashboard, the exports and sold
+detection all read that file.
 
-[`main.py`](main.py) is the front door for exporting listings. The packages
-below are the pieces it is built from, and each still runs on its own; they
-share `.env`, `models.json` and the `output/` convention, and nothing else.
+    python main.py crawl                         # every model, every page
+    python main.py crawl --model bmw_3series_g20
+    python main.py dashboard                     # http://127.0.0.1:5050
+    python main.py export --view cars            # JSON + CSV into output/cars/
+    python main.py check-plate 110모5877          # live lookup by plate
+    python main.py import-stock                  # sonokong stock from data/
 
-| Package | What it is for | Entry point |
-|---|---|---|
-| [`main.py`](main.py) | Export a model, trying the routes fastest-first and falling through when Encar blocks one | `python main.py` |
-| [`listing_export/`](listing_export/) | One-off export of a model's listings: car number + model info, no database | `python listing_export/export_listings.py` |
-| [`brightdata_collector/`](brightdata_collector/) | Run the Bright Data DCA collector and collect what it returns | `python brightdata_collector/trigger_collector.py` |
-| [`stock_pipeline/`](stock_pipeline/) | The recurring crawl into MySQL, sold detection, and the dashboard | `python stock_pipeline/crawl_listings.py` |
+## How a crawl runs
 
-## main.py
+For each model in `models.json`:
 
-Every route reaches the same two facts per car — the vehicle number and the
-model — at wildly different costs, and the cheap ones are the ones Encar blocks
-first. So they are tried in order and the run stops at the first that delivers.
-Measured on a 1130-car model:
+1. **Open a batch** in `crawl_batches`.
+2. **Load the car numbers already known** from `vehicles`. A listing keeps its
+   vehicle number for as long as it exists, so those cars cost no request.
+   Numbers older than `--detail-max-age` (90 days) are looked up again.
+3. **Walk the route ladder**, fastest first, stopping at the first route
+   that delivers (see below).
+4. **Store every row** into `vehicles`, merging: a sparse route never blanks
+   a field a richer one stored.
+5. **Sold detection**, only if the run passes the guards in
+   [`guards.py`](encar/guards.py): every page covered, ≥99% of pages and cars
+   arrived, not a collapse against the last good run. Listings of the model
+   that were not seen get `missing_streak + 1`; at 2 consecutive misses they
+   become `SOLD`. A listing seen again goes straight back to live.
+6. **Close the batch** as OK / PARTIAL / FAILED, with the route used and what
+   every route did.
 
-| Route | One page of 20 | Notes |
-|---|---|---|
-| `api-direct` | **1.1s** | JSON, no rendering. Whole model in 21s. Free |
-| `api-scrapingbee` | **11.9s** | Same JSON through ScrapingBee. Classic tier (1 credit) gets through; capped at ~3 concurrent by the plan |
-| `api-brightdata` | — | Same again through Bright Data. **402 until the zone passes KYC** |
-| `page-local` | 12.7s | Local Chromium for the listing, plain HTML for the detail |
-| `collector` | 85s (231s for ten) | Hosted, renders everything, billed per run |
+One crawl at a time (lock file `var/crawl.lock`); a second exits with code 2.
 
-The two paid API routes exist for one situation: Encar has blocked this host's
-IP. They are the only cheap way out of that, because they are still JSON — no
-rendering, 0.9 KB a car — so they cost a fraction of what the collector does.
+## The route ladder
 
-Two things keep a repeated export off the rate limit:
+| # | Route | How | One page of 20 | Cost / caveat |
+|---|---|---|---|---|
+| 1 | `api-direct` | `api.encar.com` JSON from this host | 1.1s | Free. Encar answers 403/407/429 once a host asks too often |
+| 2 | `api-scrapingbee` | Same JSON through ScrapingBee | 11.9s | Credits; ~3 concurrent on the plan. Needs `SCRAPINGBEE_KEY` |
+| 3 | `api-brightdata` | Same JSON through a Bright Data zone | ~15s | Needs `BRIGHTDATA_PROXY_URL` or `BRIGHTDATA_WS`. A zone without KYC answers 402 |
+| 4 | `page-local` | Local Chromium reads the search page's own XHR; plate from the detail page HTML | 12.7s | Free, same IP as route 1. **Currently blocked** (see below) |
+| 5 | `collector` | Hosted Bright Data collector renders every page | 85s | Billed per run; capped at 10 pages; never drives sold detection. Needs `API_TOKEN_BRINGDATA` |
 
-**The plate cache.** A vehicle number never changes, so a car id is looked up
-once, ever ([`plate_cache.py`](listing_export/plate_cache.py)). The second run
-over a model only asks about newly listed cars — 16000 cars drops from 16800
-requests to 800, which is below the limit entirely. `--no-cache` to ignore it.
+A route is dropped when it raises, returns no rows, fills under 80% of the
+car numbers (`--min-fill`), or loses more than 2% of the cars Encar's Count
+says exist. The fullest dropped run is still used if nothing better lands,
+marked incomplete — and an incomplete run never marks anything sold.
 
-Because nothing in an entry ever changes, nothing can tell when one is wrong,
-so entries are re-fetched after `--cache-max-age` days (90 by default). That
-costs almost nothing: a listing rarely lives that long, so most entries are
-retired by the car being delisted first.
+Blocks are remembered in the `route_state` table: a throttled route is skipped
+for 5 minutes (`--cooldown`), an account refusal (402, quota spent) for a day.
+`--race` starts the collector in the background as soon as a route fails.
 
-**Automatic pacing.** Encar allows roughly 1200 requests before it starts
-answering 403/407/429, and the block takes minutes to clear. A run that fits
-inside that budget is not slowed down at all; one that does not paces itself to
-hold about 4 requests/second. `--delay N` to override, `--delay 0` to run flat
-out.
+Within a route, throttled requests are retried (3 rounds, 10s apart) except on
+the very first request, where a block means "move to the next route now".
+Pacing is automatic: nothing under Encar's ~1200-request budget, ~4 req/s
+above it (`--delay` to override).
 
-    --pages 1-5             page, range, or all (default)
-    --model KEY             a models.json entry
-    --strategies a,b,c      which routes to try, in order
-    --race                  start the collector in the background when a route
-                            fails, instead of waiting to reach it in turn
-    --print                 dump the JSON to stdout as well as to output/
+`--pages 1-5` (the site's pages of 20) crawls part of a model — useful for a
+quick look, but it never runs sold detection.
 
-Check `complete` in the output before trusting a run: a listing page that never
-landed takes its 20 cars with it, and the other counts are computed over the
-rows that did arrive. `missingCars` and `pagesFailed` say what went missing.
+`page-local` stopped working before this refactor: the search page loads but
+never fires its listing XHR in headless Chromium, with the old code too. It
+stays in the ladder; the routes above it carry the crawl.
 
-### models.json
+## The database
 
-An entry names as much of the hierarchy as it wants, and the query stops at the
-last level given — so the same file covers one model or a whole manufacturer.
-Verified against the live API:
-
-| Entry | `Count` |
+| Table / view | What |
 |---|---|
-| `bmw_3series_g20` — manufacturer + group + model | 1,127 |
-| `bmw_3series` — manufacturer + group | 1,734 |
-| `bmw` — manufacturer | 17,948 |
-| `benz` | 16,932 |
-| `hyundai` — `car_type: "Y"` for domestic makes | 50,382 |
+| `vehicles` | One row per Encar listing (`car_id`): plate, model, price, mileage, colour…, `status` ACTIVE/SOLD, `missing_streak`, first/last seen |
+| `crawl_batches` | One row per model per crawl: route, attempts, coverage, sold check |
+| `route_state` | Routes on hold and until when |
+| `product_group`, `rent_product` | The sonokong stock, from `import-stock` |
+| **`car_status`** (view) | **The one to read.** One row per plate, Encar and stock joined |
+
+`car_status.status`:
+
+| Status | | Meaning |
+|---|---|---|
+| `ON_SALE` | 판매중 | At least one ad is live and was seen in the latest crawl |
+| `CHECKING` | 확인중 | Missing from the latest crawl; one more miss and it is sold |
+| `SOLD` | 판매완료 | Every ad for the plate is gone |
+| `NOT_FOUND` | 미확인 | In stock but never seen on Encar — its model is not in `models.json` |
+
+A car is often posted by several dealers (several `car_id`, one plate), so
+status is per plate: sold only once every ad is gone.
+
+Query it directly with `sqlite3 var/encar.db "select status, count(*) from car_status group by 1"`.
+
+## models.json
+
+An entry names as much of the hierarchy as it wants; the query stops at the
+last level given:
+
+| Entry | Listings |
+|---|---|
+| `bmw_3series_g20` — manufacturer + group + model | ~1,100 |
+| `bmw_3series` — manufacturer + group | ~1,700 |
+| `bmw` — manufacturer | ~18,000 |
+| `hyundai` — `car_type: "Y"` for domestic makes | ~50,000 |
+
+The first crawl of a big model is one detail request per car (≈4 req/s once
+paced, so `hyundai` is hours); every crawl after that only asks about new
+cars. Overlapping entries (`bmw` and `bmw_3series_g20`) are safe: a listing
+belongs to the model whose crawl last saw it, and only that model's complete
+crawls can mark it missing.
+
+To resolve the stock's 미확인 cars, add their models (Korean makes need
+`"car_type": "Y"`) and crawl.
+
+## Files
+
+    main.py              entry point -> encar/cli.py
+    encar/               the package
+      routes.py ladder.py   the five routes and the fallback ladder
+      api.py transport.py   JSON API: listing + detail, pacing, transports
+      browser.py collector.py   the browser route, the hosted collector
+      parse.py             the shared row shape
+      store.py guards.py crawl.py   database, sold-detection gate, orchestration
+      dashboard.py templates/   the web UI
+      plates.py stock_import.py export.py
+    collector/           the Bright Data collector's own scripts (run in its IDE)
+    data/                sonokong dumps, sample plate list
+    var/                 encar.db (+ crawl.lock) — the data; back it up
+    output/  logs/       exports and the run log; safe to delete
+
+`var/`, `output/` and `logs/` are not tracked in git.
+
+## Setup
+
+    pip install requests python-dotenv flask   # + playwright for page-local
+    cp .env.example .env                        # proxy / collector credentials
+    python main.py import-stock
+    python main.py crawl --model bmw_3series_g20
+
+## Online
+
+    ./serve.sh --local                # gunicorn on http://127.0.0.1:5050 only
+    ./serve.sh                        # + Cloudflare tunnel, public HTTPS URL
+    scripts/install-launchd.sh        # both, always on, plus a daily crawl
+    scripts/install-launchd.sh --models "bmw_3series_g20 benz" --at 05:30
+    scripts/install-launchd.sh --uninstall
+
+The dashboard asks for a login (`DASHBOARD_USER` / `DASHBOARD_PASSWORD` in
+`.env`); `serve.sh` will not open a tunnel without a password, and without one
+the app refuses anything that arrives through Cloudflare.
+
+Without `CLOUDFLARE_TUNNEL_TOKEN` the tunnel is a quick one: a random
+`*.trycloudflare.com` URL that changes whenever it restarts — the current one
+is in `logs/tunnel-url.txt`. For a fixed hostname, create a tunnel in the
+Cloudflare dashboard (Zero Trust → Networks → Tunnels), route its public
+hostname to `http://localhost:5050`, and put its token in `.env`.
+
+The site is up only while this Mac is awake: the LaunchAgent runs under
+`caffeinate -is`, but a closed lid still sleeps a laptop. Crawls run from the
+Mac's own IP, which is what Encar lets through.
 
 ## Tests
 
     python tests/test_crawl_logic.py
 
-The decisions the crawl makes — when a run counts as complete, how hard to
-brake, what the search expression looks like, what the cache may and may not
-forget — with no network involved. Plain asserts, no pytest.
-
-## stock_pipeline
-
-    migrate.py             apply migrations/ (tracked in `schema_migrations`)
-    crawl_listings.py      crawl -> `vehicles`, missing-streak sold detection
-    sync_sold.py           crawl -> compare against `stock`, mark SOLD
-    check_plate_status.py  ad-hoc "is this plate still on sale", no database
-    import_rent_stock.py   load the sonokong product_group / rent_product dumps
-    dashboard.py           local web UI (./serve.sh runs it behind gunicorn)
-
-Shared modules, used by all of the above: `config.py` (paths + env settings),
-`encar_api.py` (every Encar call), `db.py` (connection, run lock,
-`crawl_batches`), `guards.py` (is this crawl healthy enough to conclude
-anything from what is missing), `models.py`, `run_log.py`, `results.py`.
-
-The daily crawl reuses the vehicle numbers it already stored: a car keeps its
-number for as long as the listing exists, so only newly listed cars cost a
-detail request. That is what keeps the crawl under Encar's request limit as
-models are added — `--refresh-details` forces the old behaviour when a row
-needs repairing.
-
-## Output
-
-Every tool writes the same document, so runs can be diffed across tools:
-
-```json
-{
-  "tool": "listing_export",
-  "name": "bmw_3series_g20",
-  "crawledAt": "2026-09-17T11:39:14+07:00",
-  "count": 5,
-  "...": "run metadata",
-  "rows": [{ "page": 1, "car_id": "42565728", "car_number": "…", "model_info": "…" }]
-}
-```
-
-and the same flags, everywhere:
-
-    --json PATH     write the run as JSON here
-    --csv PATH      write the rows as CSV here (utf-8-sig, opens in Excel)
-    --out-dir [DIR] write both, named <name>_<timestamp>, default
-                    output/<tool>/ — so runs never overwrite each other
-
-`output/` and `logs/` are not tracked in git, and neither is `var/` — which is
-separate on purpose. `output/` holds results, safe to delete at any time;
-`var/` holds what the next run reads: `plate_cache.json` (car numbers already
-looked up) and `throttle_state.json` (which routes are still blocked). Deleting
-the cache costs thousands of requests to rebuild.
-
-## Setup
-
-    pip install requests pymysql python-dotenv flask   # + playwright for --source page
-    cp .env.example .env    # DB_*, BRIGHTDATA_*, API_TOKEN_BRINGDATA
-    python stock_pipeline/migrate.py
+The decisions — when a route counts, when sold detection may run, how rows
+merge, what the cache may forget — with no network. Plain asserts, no pytest.

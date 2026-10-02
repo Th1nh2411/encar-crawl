@@ -1,12 +1,13 @@
 """
-http_transport.py -- How listing_export reaches Encar.
+transport.py -- How the API routes reach Encar's JSON endpoints.
 
-Three backends behind one `get_many(requests)` batch call:
+Four backends behind one `get_many(requests)` batch call:
 
-  direct      plain HTTPS from this host, on a thread pool. Verified to work
-              with no headers at all, so this is the fast path and the default.
-  bd-proxy    the same, routed through a Bright Data *proxy* zone.
-  bd-browser  Bright Data's Scraping Browser, driven over CDP.
+  direct       plain HTTPS from this host, on a thread pool. Verified to work
+               with no headers at all, so this is the fast path and the default.
+  scrapingbee  the same calls through ScrapingBee's API, from its IPs.
+  bd-proxy     the same, routed through a Bright Data *proxy* zone.
+  bd-browser   Bright Data's Scraping Browser, driven over CDP.
 
 Which Bright Data backend applies depends on the zone, and the zone decides for
 itself: pointing a Scraping Browser credential at the proxy port is answered
@@ -14,10 +15,11 @@ with `403 You are trying to use Scraping Browser zone as regular proxy`. So the
 rule is explicit rather than guessed -- BRIGHTDATA_PROXY_URL selects the proxy,
 BRIGHTDATA_WS selects the browser.
 
-`auto` (the default) goes direct and only falls back to Bright Data once Encar
-has actually throttled the run. Both Bright Data paths are slower than direct
-by a wide margin -- the browser one boots a real Chrome -- so they earn their
-place as the thing that keeps a run alive, not as the way it normally goes.
+Which one a crawl uses is the ladder's decision (ladder.py): direct first,
+the paid ones only once Encar has blocked this host. They are slower than
+direct by a wide margin -- the browser one boots a real Chrome -- so they earn
+their place as the thing that keeps a run alive, not as the way it normally
+goes.
 
 The batch shape matters: the browser backend pays a fixed connection cost, and
 handing it all 20 detail requests at once means paying it once.
@@ -32,6 +34,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, quote, urlencode
 
 import requests
+import requests.adapters
 
 # Encar sits behind CloudFront. These are the statuses it answers a client with
 # when it is rate limiting rather than genuinely refusing the request.

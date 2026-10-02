@@ -1,10 +1,12 @@
 """
-browser_source.py -- Read Encar the way a browser does, not by calling the API.
+browser.py -- Read Encar the way a browser does, not by calling the API.
 
-Two steps, both through the Bright Data Scraping Browser:
+The `page-local` route. Two steps:
 
-  listing  load the real search page and read the XHR it fires for itself
-  detail   fetch the car's detail page and pull the JSON embedded in its HTML
+  listing  load the real search page in a local Chromium and read the XHR it
+           fires for itself
+  detail   fetch the car's detail page over plain HTTP and pull the JSON
+           embedded in its HTML (parse.detail_fields_from_html)
 
 Why it is shaped this way
 -------------------------
@@ -23,42 +25,33 @@ needed, so it is fetched as plain HTML through the same browser.
 
 Reliability, measured
 ---------------------
-CloudFront blocks Bright Data's datacenter exit IPs unpredictably. When it
-does, the page still loads 200 but fires no XHR at all and Encar throws a
-JavaScript alert -- that is the signature to look for, not an HTTP error.
-Across runs this worked sometimes and returned nothing other times, so the
-listing step retries on a fresh CDP session, which is what changes the exit IP.
-The detail step was not affected.
+When Encar does not like a client, the page still loads 200 but fires no XHR
+at all and throws a JavaScript alert -- that is the signature to look for, not
+an HTTP error. The listing step retries on a fresh browser session.
 
-Both steps go out from this host. Routing the detail pages through a Bright
-Data residential zone was tried and removed: without KYC the zone enforces
-Encar's robots.txt, `fem.encar.com` bars `/cars/detail/`, and every request
-came back 402. See the README.
+Both steps go out from this host, unproxied. Routing them through a Bright
+Data zone was tried and removed: without KYC the zone enforces Encar's
+robots.txt -- `www.encar.com` says `Disallow: /js/`, so the site's JavaScript
+never boots, and `fem.encar.com` bars `/cars/detail/` -- and every request came
+back 402. The Scraping Browser zone loads the JavaScript, but Encar serves its
+datacenter exit IPs nothing.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit, parse_qs, unquote
 
+from .parse import DETAIL_PAGE, Row, apply_detail, detail_fields_from_html
+
 SEARCH_PAGE = "https://www.encar.com/fc/fc_carsearchlist.do?carType=for"
-DETAIL_PAGE = "https://fem.encar.com/cars/detail/{car_id}"
 
 # The listing XHR, told apart from the promo carousels the page also loads by
 # its `sr` parameter -- those ask for their own offsets and counts.
 LISTING_PATH = "/search/car/list/"
-
-# The detail HTML is one big JSON blob inside markup, so the fields are pulled
-# out by name rather than by parsing a document that has no stable shape.
-RE_VEHICLE_NO = re.compile(r'"vehicleNo"\s*:\s*"([^"]+)"')
-RE_FIELD = {
-    name: re.compile(r'"%s"\s*:\s*"([^"]*)"' % name)
-    for name in ("manufacturerName", "modelName", "gradeName", "gradeDetailName")
-}
 
 # www.encar.com serves EUC-KR; fem.encar.com serves UTF-8.
 ENCODINGS = ("utf-8", "euc-kr", "cp949")
@@ -118,27 +111,12 @@ def listing_score(url: str, rows: int, page: int, limit: int,
     return score
 
 
-def parse_detail_page(html: str, fallback: str) -> Tuple[Optional[str], str]:
-    """Car number and model info out of a detail page's embedded JSON."""
-    match = RE_VEHICLE_NO.search(html)
-    car_number = match.group(1) if match else None
-
-    parts: List[str] = []
-    for name in ("manufacturerName", "modelName", "gradeName", "gradeDetailName"):
-        found = RE_FIELD[name].search(html)
-        if found and found.group(1):
-            parts.append(found.group(1))
-
-    return car_number, (" ".join(parts) or fallback)
-
-
 class BrowserSource:
-    """Drives one Scraping Browser session for both steps.
+    """Drives one browser session for the listing, and an HTTP pool for details.
 
     The browser, the Playwright driver and the event loop are created once and
-    kept: the CDP handshake costs about a second, which is more than the work
-    it carries. `_reconnect()` throws the session away on purpose when the
-    listing step is blocked, because a new session is what gets a new exit IP.
+    kept. The session is thrown away on purpose when the listing step is
+    blocked, because a fresh one is what a retry needs.
     """
 
     # When the listing XHR comes at all it lands within a few seconds of
@@ -148,15 +126,7 @@ class BrowserSource:
     # blocked page costing 20s and costing 8s, twice per run.
     XHR_TIMEOUT = 8.0
 
-    def __init__(self, ws_url: Optional[str] = None, workers: int = 8,
-                 timeout: float = 60.0, log=print, browser: str = "local"):
-        if browser not in ("local", "brightdata"):
-            raise ValueError(f"unknown browser: {browser!r}")
-        if browser == "brightdata" and not ws_url:
-            raise RuntimeError("browser=brightdata needs BRIGHTDATA_WS")
-
-        self.ws_url = ws_url
-        self.browser_kind = browser
+    def __init__(self, workers: int = 8, timeout: float = 60.0, log=print):
         self.workers = workers
         self.timeout = timeout
         self.log = log
@@ -177,27 +147,14 @@ class BrowserSource:
         if self._pw is None:
             self._pw = await async_playwright().start()
         if self._browser is None:
-            if self.browser_kind == "brightdata":
-                self._browser = await self._pw.chromium.connect_over_cdp(
-                    self.ws_url, timeout=self.timeout * 1000
-                )
-            else:
-                # Local Chromium, on this host's own IP. The listing step must
-                # load www.encar.com/js/*, and a Bright Data residential zone
-                # refuses those: robots.txt says `Disallow: /js/`, the zone
-                # enforces it, and the site's JavaScript never boots. So the
-                # local browser deliberately goes out unproxied.
-                self._browser = await self._pw.chromium.launch()
+            # Local Chromium, on this host's own IP, deliberately unproxied --
+            # see the module docstring for why a proxy zone cannot do this.
+            self._browser = await self._pw.chromium.launch()
 
         browser = self._browser
-        if self.browser_kind == "brightdata":
-            # The Scraping Browser hands out one pre-configured context and its
-            # proxy lives there; a new_context() is not routed through it.
-            ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-        else:
-            ctx = browser.contexts[0] if browser.contexts else await browser.new_context(
-                locale="ko-KR"
-            )
+        ctx = browser.contexts[0] if browser.contexts else await browser.new_context(
+            locale="ko-KR"
+        )
         # Encar pops an alert when it does not like the client. Left unhandled
         # it blocks every later call on the page.
         ctx.on("dialog", lambda d: asyncio.create_task(_dismiss(d)))
@@ -224,7 +181,7 @@ class BrowserSource:
                 return data
             if attempt < attempts - 1:
                 self.log(f"    page {page}: no listing XHR "
-                         f"(blocked), retrying on a fresh exit IP")
+                         f"(blocked), retrying on a fresh browser")
                 self._get_loop().run_until_complete(self._drop_browser())
                 time.sleep(2.0)
         return None
@@ -288,27 +245,33 @@ class BrowserSource:
 
     # ── detail ────────────────────────────────────────────────────────────
 
-    def car_numbers(self, items: List[Dict[str, Any]]) -> List[Tuple[Optional[str], str]]:
-        """Car number and model info per listing, from the detail pages' HTML.
+    def fill_details(self, rows: List[Row]) -> int:
+        """Fill rows in place from their detail pages. Returns how many got a number.
 
         This is plain HTTP on a thread pool, not the browser: the detail page is
         server-rendered and already carries the vehicle record as JSON in its
         markup, so there is nothing to execute.
         """
-        if not items:
-            return []
+        if not rows:
+            return 0
 
         import concurrent.futures
 
         session = self._http()
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(self.workers, len(items))
+            max_workers=min(self.workers, len(rows))
         ) as pool:
-            return list(pool.map(lambda it: self._car_number(session, it), items))
+            found = list(pool.map(lambda r: self._detail(session, r["car_id"]), rows))
+
+        for row, fields in zip(rows, found):
+            if fields:
+                apply_detail(row, fields)
+        return sum(1 for r in rows if r.get("vehicle_no"))
 
     def _http(self):
         if self._session is None:
             import requests
+            import requests.adapters
 
             session = requests.Session()
             session.trust_env = False
@@ -327,19 +290,14 @@ class BrowserSource:
             self._session = session
         return self._session
 
-    def _car_number(self, session, item: Dict[str, Any]) -> Tuple[Optional[str], str]:
-        fallback = " ".join(
-            str(p) for p in (item.get("Manufacturer"), item.get("Model"),
-                             item.get("Badge")) if p
-        )
-        url = DETAIL_PAGE.format(car_id=item.get("Id"))
+    def _detail(self, session, car_id: str) -> Optional[Dict[str, Any]]:
         try:
-            resp = session.get(url, timeout=self.timeout)
+            resp = session.get(DETAIL_PAGE.format(car_id=car_id), timeout=self.timeout)
             if resp.status_code != 200:
-                return None, fallback
-            return parse_detail_page(decode(resp.content), fallback)
+                return None
+            return detail_fields_from_html(decode(resp.content))
         except Exception:
-            return None, fallback
+            return None
 
     # ── teardown ──────────────────────────────────────────────────────────
 

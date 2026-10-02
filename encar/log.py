@@ -1,14 +1,16 @@
 """
-run_log.py — The one logging call the pipeline scripts share, plus the
-duration formatting that goes with it.
+log.py -- The one logging call, plus the file it can tee into.
 
-log() prints to stdout and, once setup_file_log() has been called, also
-appends to a rotating file. Cron discards stdout, so that file is the record
-of what a run actually did.
+Progress goes to stderr so stdout stays free for a JSON document (--print).
+Once setup_file_log() has run, every line is also appended to a rotating file:
+cron discards the console, and the dashboard reads that file.
 """
+
+from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Optional
 
 _file_logger: Optional[logging.Logger] = None
@@ -40,10 +42,10 @@ def setup_file_log(path: str) -> str:
 
 
 def log(msg: str) -> None:
-    print(msg, flush=True)
+    print(msg, file=sys.stderr, flush=True)
     if _file_logger is not None:
-        # The console layout uses blank lines and indentation; the file wants
-        # one timestamped record per line.
+        # The console uses blank lines and indentation; the file wants one
+        # timestamped record per line.
         for line in msg.splitlines():
             if line.strip():
                 _file_logger.info(line.rstrip())
