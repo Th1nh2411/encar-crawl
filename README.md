@@ -128,7 +128,7 @@ To resolve the stock's 미확인 cars, add their models (Korean makes need
       plates.py stock_import.py export.py
     collector/           the Bright Data collector's own scripts (run in its IDE)
     data/                sonokong dumps, sample plate list
-    deploy/              systemd unit + Apache vhost for a server
+    deploy/              PM2 config (+ optional Apache vhost) for a server
     scripts/             install-launchd.sh (Mac: keep the dashboard online)
     var/                 encar.db (+ crawl.lock) — the data; back it up
     output/  logs/       exports and the run log; safe to delete
@@ -154,7 +154,7 @@ Login: `DASHBOARD_USER` / `DASHBOARD_PASSWORD` in `.env` (HTTP Basic). With no
 password the dashboard answers only direct local requests and refuses anything
 that comes through a proxy (Apache, Cloudflare) — it cannot go online open.
 
-## Server (Apache)
+## Server (PM2, http://ip:9191)
 
     sudo useradd -r -m -d /opt/encar-crawl encar
     sudo -u encar git clone https://github.com/Th1nh2411/encar-crawl.git /opt/encar-crawl
@@ -169,14 +169,16 @@ that comes through a proxy (Apache, Cloudflare) — it cannot go online open.
     sudo -u encar .venv/bin/python main.py crawl --model bmw_3series_g20 \
         --pages 1 --no-sold --routes api-direct
 
-    sudo cp deploy/encar-dashboard.service /etc/systemd/system/
-    sudo systemctl daemon-reload && sudo systemctl enable --now encar-dashboard
+    # run it with PM2 (deploy/ecosystem.config.js), as the encar user
+    sudo -u encar pm2 start deploy/ecosystem.config.js
+    sudo -u encar pm2 save           # + `pm2 startup` once, to come back after a reboot
+    sudo ufw allow 9191/tcp          # and the cloud security group, if any
 
-    sudo a2enmod proxy proxy_http headers
-    sudo cp deploy/apache-encar.conf /etc/apache2/sites-available/encar.conf
-    # edit ServerName
-    sudo a2ensite encar && sudo systemctl reload apache2
-    sudo certbot --apache -d encar.example.com
+Then open `http://<server-ip>:9191`. That is plain HTTP, so keep a
+`DASHBOARD_PASSWORD` (the app refuses remote requests without one), and ideally
+allow the port only from your own IPs. For HTTPS under a domain, put Apache in
+front instead: `deploy/apache-encar.conf`, with the PM2 bind changed back to
+`127.0.0.1:9191`.
 
 No Cloudflare software is needed on a server; `serve.sh` and
 `scripts/install-launchd.sh` are for running it from a Mac. Run it in one

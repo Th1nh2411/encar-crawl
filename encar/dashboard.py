@@ -26,9 +26,9 @@ Crawl and import run as a background job, one at a time: this process refuses
 a second, and the crawl's lock file blocks one started elsewhere.
 
 Access: with DASHBOARD_PASSWORD set in .env, every request needs an HTTP
-Basic login (DASHBOARD_USER, default `admin`); serve it over HTTPS. Without a
-password the dashboard only answers direct local requests: anything that
-arrives through a proxy -- Apache, Cloudflare -- is refused, so putting it
+Basic login (DASHBOARD_USER, default `admin`). Without a password the
+dashboard only answers requests from this machine: another address (ip:port)
+or anything through a proxy (Apache, Cloudflare) is refused, so putting it
 online without a login fails closed rather than open.
 """
 
@@ -63,9 +63,12 @@ PROXY_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP",
 @app.before_request
 def require_login():
     if not DASHBOARD_PASSWORD:
-        # A reverse proxy reaches the app on loopback, so the address cannot
-        # tell a proxied request from a local one; the headers it adds can.
-        if any(request.headers.get(h) for h in PROXY_HEADERS):
+        # Without a password only this machine may look. A request from
+        # elsewhere either comes from another address (the app bound to
+        # 0.0.0.0, reached as ip:port) or through a reverse proxy, which
+        # connects from loopback but adds its own headers.
+        local = request.remote_addr in ("127.0.0.1", "::1")
+        if not local or any(request.headers.get(h) for h in PROXY_HEADERS):
             return Response("Set DASHBOARD_PASSWORD in .env before putting the "
                             "dashboard online.\n", 403, mimetype="text/plain")
         return None
