@@ -135,6 +135,30 @@ To resolve the stock's 미확인 cars, add their models (Korean makes need
 
 `var/`, `output/` and `logs/` are not tracked in git.
 
+## Partners stock sold sync (every 10 minutes)
+
+    python main.py sync-sold                    # one run
+    python main.py sync-sold --dry-run          # check and log, POST nothing
+    python main.py sync-sold --car-id 42229086 --dry-run
+
+One run ([`partners.py`](encar/partners.py)): `GET <PARTNERS_API_URL>/active-car-id`,
+then the Encar detail endpoint for every `carid`, then
+`POST <PARTNERS_API_URL>/update-car-id` with `{"carIds": [...]}` for the sold
+ones (`listSoldCarId` in the log). Sold = Encar answers 404 for the listing,
+confirmed by a second ask 5s later; a block or timeout is never read as sold.
+Log: `logs/sync-sold.log`. One run at a time (`var/sync-sold.lock`).
+
+Scheduled by PM2 as `encar-sync-sold` in `deploy/ecosystem.config.js`
+(`cron_restart: */10`). Without PM2, a crontab line does the same:
+
+    */10 * * * * cd /opt/encar-crawl && .venv/bin/python main.py sync-sold >/dev/null 2>&1
+
+By hand through the dashboard (same login as the UI):
+
+    curl -u admin:$PASS -X POST http://<host>:9191/api/sync-sold \
+         -H 'Content-Type: application/json' -d '{"dryRun": true}'
+    # or {"carIds": ["42229086"], "dryRun": true} to check given ids only
+
 ## The dashboard
 
 Everything is done from the web UI; nothing runs on a schedule.

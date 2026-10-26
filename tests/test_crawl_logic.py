@@ -409,6 +409,23 @@ def test_route_state_round_trips():
     assert store.load_route_state(conn)["api-direct"]["cooldown"] == 300.0
 
 
+
+def test_partners_sold_verdict():
+    from encar.partners import ACTIVE, ERROR, SOLD, verdict
+    from encar.transport import Result
+
+    def ad(status, sales=None):
+        return Result(data={"advertisement": {"status": status, "salesStatus": sales}},
+                      status=200)
+
+    assert verdict(ad("ADVERTISE")) == ACTIVE
+    assert verdict(ad("ADVERTISE", "CONTRACT")) == ACTIVE  # under contract, not sold
+    assert verdict(ad("SOLD")) == SOLD
+    assert verdict(Result(status=404, error="HTTP 404")) == SOLD
+    # A block or a timeout says nothing about the car: never sold.
+    for res in (Result(status=407, error="HTTP 407"), Result(error="timeout")):
+        assert verdict(res) == ERROR
+
 def main_() -> int:
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

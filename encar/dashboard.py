@@ -15,6 +15,8 @@ else is a closer look at a row of it:
 
     /check            live "is this plate on sale" lookup
 
+    POST /api/sync-sold   one partners-stock sold sync by hand (partners.py)
+
 Everything is driven from here -- there is no scheduled crawl:
 
     Crawl now         spawns `main.py crawl` for the chosen model
@@ -406,6 +408,35 @@ def api_check_plate():
     finally:
         conn.close()
     return jsonify({"ok": True, "results": results})
+
+
+@app.post("/api/sync-sold")
+def api_sync_sold():
+    """One sync-sold run, by hand: what the 10-minute schedule does.
+
+    Body: {"dryRun": true} to skip update-car-id; {"carIds": [...]} to check
+    these ids instead of asking partners-stock.
+    """
+    from .crawl import Locked
+    from .partners import sync_sold
+
+    body = json_body()
+    if body is None:
+        return jsonify({"ok": False, "message": "JSON body required"}), 415
+    raw = body.get("carIds")
+    car_ids = None
+    if raw is not None:
+        car_ids = list(dict.fromkeys(str(x).strip() for x in raw if str(x).strip()))
+        if len(car_ids) > CHECK_MAX:
+            return jsonify({"ok": False,
+                            "message": f"At most {CHECK_MAX} car ids at a time"}), 400
+    try:
+        result = sync_sold(car_ids, dry_run=bool(body.get("dryRun")))
+    except Locked:
+        return jsonify({"ok": False, "message": "A sync-sold run is already going"}), 409
+    except Exception as exc:
+        return jsonify({"ok": False, "message": f"{type(exc).__name__}: {exc}"}), 502
+    return jsonify({"ok": True, **result})
 
 
 # ── Template helpers ──────────────────────────────────────────────────────────

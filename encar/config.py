@@ -40,6 +40,13 @@ DB_PATH = _path("ENCAR_DB", os.path.join("var", "encar.db"))
 LOCK_PATH = os.path.join(VAR_DIR, "crawl.lock")
 LOG_PATH = _path("LOG_FILE", os.path.join("logs", "encar.log"))
 
+# ── Partners stock (sync-sold) ────────────────────────────────────────────────
+# The service whose Encar car ids are checked every 10 minutes; see partners.py.
+PARTNERS_API_URL = (os.getenv("PARTNERS_API_URL")
+                    or "https://qa-mng.702prime.com/api/partners-stock").rstrip("/")
+PARTNERS_LOCK_PATH = os.path.join(VAR_DIR, "sync-sold.lock")
+PARTNERS_LOG_PATH = _path("PARTNERS_LOG_FILE", os.path.join("logs", "sync-sold.log"))
+
 # The JSON cache the file-only exporter used to keep. Read once into the
 # database on the first crawl, so the car numbers it holds are not fetched again.
 LEGACY_PLATE_CACHE = os.path.join(VAR_DIR, "plate_cache.json")
