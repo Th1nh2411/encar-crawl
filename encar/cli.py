@@ -174,7 +174,7 @@ def cmd_sync_sold(args) -> int:
     if args.log_file:
         setup_file_log(args.log_file)
     try:
-        result = sync_sold(args.car_ids or None, dry_run=args.dry_run)
+        result = sync_sold(args.car_ids or None, dry_run=args.dry_run, source="cron")
     except Locked as exc:
         log(f"{exc} -- exiting.")
         return 2

@@ -14,6 +14,7 @@ else is a closer look at a row of it:
                       whether sold detection ran -- plus the tail of the log
 
     /check            live "is this plate on sale" lookup
+    /sync             sync-sold history: every cron / manual run, with its car ids
 
     POST /api/sync-sold   one partners-stock sold sync by hand (partners.py)
 
@@ -280,6 +281,32 @@ def runs():
         "index.html", view="runs", rows=rows, total=total, page=page,
         pages=max(1, math.ceil(total / PAGE_SIZE)), routes=routes,
         log_tail=tail_log(), status_meta=STATUS, filters={}, **header())
+
+
+@app.route("/sync")
+def sync_runs():
+    from .config import PARTNERS_API_URL
+
+    page = page_arg()
+    conn = db()
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM sync_runs").fetchone()[0]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT *, CAST((julianday(finished_at) - julianday(started_at)) * 86400 "
+            "AS INTEGER) AS duration_s FROM sync_runs ORDER BY id DESC "
+            "LIMIT ? OFFSET ?", (PAGE_SIZE, (page - 1) * PAGE_SIZE))]
+    finally:
+        conn.close()
+    for r in rows:
+        for key in ("checked_ids", "active_ids", "sold_ids", "error_ids"):
+            try:
+                r[key] = json.loads(r.get(key) or "null")
+            except ValueError:
+                r[key] = None
+    return render_template(
+        "index.html", view="sync", rows=rows, total=total, page=page,
+        pages=max(1, math.ceil(total / PAGE_SIZE)), partners_url=PARTNERS_API_URL,
+        status_meta=STATUS, filters={}, **header())
 
 
 @app.route("/export.<fmt>")

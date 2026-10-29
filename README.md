@@ -77,6 +77,7 @@ stays in the ladder; the routes above it carry the crawl.
 | `vehicles` | One row per Encar listing (`car_id`): plate, model, price, mileage, colour…, `status` ACTIVE/SOLD, `missing_streak`, first/last seen |
 | `crawl_batches` | One row per model per crawl: route, attempts, coverage, sold check |
 | `route_state` | Routes on hold and until when |
+| `sync_runs` | One row per sold sync run: car ids checked, active, sold, reported |
 | `product_group`, `rent_product` | The sonokong stock, from `import-stock` |
 | **`car_status`** (view) | **The one to read.** One row per plate, Encar and stock joined |
 
@@ -147,6 +148,8 @@ then the Encar detail endpoint for every `carid`, then
 ones (`listSoldCarId` in the log). Sold = Encar answers 404 for the listing,
 confirmed by a second ask 5s later; a block or timeout is never read as sold.
 Log: `logs/sync-sold.log`. One run at a time (`var/sync-sold.lock`).
+Every run, cron or manual, is kept in the `sync_runs` table and shown on the
+dashboard's **Sold sync** tab (hover a count for its car ids).
 
 Scheduled by PM2 as `encar-sync-sold` in `deploy/ecosystem.config.js`
 (`cron_restart: */10`). Without PM2, a crontab line does the same:

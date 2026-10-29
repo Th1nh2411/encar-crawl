@@ -426,6 +426,15 @@ def test_partners_sold_verdict():
     for res in (Result(status=407, error="HTTP 407"), Result(error="timeout")):
         assert verdict(res) == ERROR
 
+
+def test_sync_runs_keep_their_car_ids():
+    conn = db()
+    store.save_sync_run(conn, {"started_at": "t", "source": "cron", "status": "OK",
+                               "checked_ids": ["1", "2"], "sold_ids": ["2"]})
+    row = conn.execute("SELECT * FROM sync_runs").fetchone()
+    assert json.loads(row["checked_ids"]) == ["1", "2"]
+    assert json.loads(row["sold_ids"]) == ["2"] and row["reported"] == 0
+
 def main_() -> int:
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

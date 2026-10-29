@@ -9,6 +9,8 @@ store.py -- The database: one SQLite file, var/encar.db, and everything in it.
     crawl_batches   one row per model per crawl: which route delivered, what it
                     covered, whether sold detection ran and what it marked.
     route_state     which routes are parked after a block, and until when.
+    sync_runs       one row per sync-sold run (partners.py): what partners-stock
+                    listed, what Encar still shows, what was reported sold.
     product_group   the sonokong vehicle taxonomy  } imported from data/ by
     rent_product    the sonokong live stock        } stock_import.py
 
@@ -95,6 +97,23 @@ CREATE TABLE IF NOT EXISTS route_state (
     at       REAL NOT NULL,
     cooldown REAL NOT NULL,
     why      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT,
+    source          TEXT NOT NULL,              -- cron (main.py) / manual (dashboard API)
+    server          TEXT,                       -- partners-stock host
+    dry_run         INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL CHECK (status IN ('OK', 'FAILED')),
+    checked_ids     TEXT,                       -- JSON: active on partners-stock
+    active_ids      TEXT,                       -- JSON: still advertised on Encar
+    sold_ids        TEXT,                       -- JSON: sent to update-car-id
+    error_ids       TEXT,                       -- JSON: could not be checked
+    reported        INTEGER NOT NULL DEFAULT 0, -- update-car-id was called and answered
+    update_response TEXT,
+    note            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS product_group (
@@ -285,6 +304,18 @@ def fail_batch(conn: sqlite3.Connection, batch_id: int, note: str,
         conn.commit()
     except sqlite3.Error:
         pass
+
+
+def save_sync_run(conn: sqlite3.Connection, run: Dict[str, Any]) -> None:
+    """Store one sync-sold run. List values are kept as JSON."""
+    run = {k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v
+           for k, v in run.items()}
+    if run.get("note"):
+        run["note"] = str(run["note"])[:500]
+    cols = ", ".join(run)
+    conn.execute(f"INSERT INTO sync_runs ({cols}) VALUES ({', '.join('?' * len(run))})",
+                 tuple(run.values()))
+    conn.commit()
 
 
 def previous_ok_count(conn: sqlite3.Connection, model_key: str) -> Optional[int]:

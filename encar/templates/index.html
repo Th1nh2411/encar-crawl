@@ -149,6 +149,21 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block;
     animation: pulse 1.1s infinite; }
   @keyframes pulse { 50% { opacity: .25; } }
+
+  /* sold sync: a count that lists its car ids on hover */
+  .ids { cursor: default; border-bottom: 1px dashed var(--faint); font-weight: 600; }
+  .ids.zero { border-bottom: 0; font-weight: 400; color: var(--faint); }
+  #idpop { position: fixed; z-index: 50; display: none; min-width: 180px; max-width: 320px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.14); font-size: 12.5px; }
+  #idpop.on { display: block; }
+  #idpop .hd { display: flex; justify-content: space-between; gap: 10px; align-items: center;
+    padding: 8px 10px; border-bottom: 1px solid var(--line); font-weight: 600; }
+  #idpop .hd button { font: inherit; font-size: 11.5px; padding: 2px 8px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--panel); color: var(--muted); cursor: pointer; }
+  #idpop ul { list-style: none; margin: 0; padding: 6px 10px; max-height: 260px; overflow: auto;
+    columns: 2; column-gap: 14px; }
+  #idpop li { font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; }
 </style>
 </head>
 <body>
@@ -190,6 +205,7 @@
     <a href="/" class="{{ 'on' if view in ('cars', 'car') }}">Cars</a>
     <a href="/check" class="{{ 'on' if view == 'check' }}">Check plate</a>
     <a href="/runs" class="{{ 'on' if view == 'runs' }}">Crawl runs</a>
+    <a href="/sync" class="{{ 'on' if view == 'sync' }}">Sold sync</a>
   </nav>
 
 {% if view == 'cars' %}
@@ -406,6 +422,59 @@
     <div class="scroll" id="checkout"></div>
   </div>
 
+{% elif view == 'sync' %}
+  {# ── Sold sync: partners-stock car ids checked on Encar ──────────────── #}
+  {% macro ids(list, label) %}
+    {% set n = (list or [])|length %}
+    <span class="ids{{ ' zero' if not n }}" data-ids='{{ (list or [])|tojson }}' data-label="{{ label }}"
+      tabindex="0">{{ n if list is not none else '—' }}</span>
+  {% endmacro %}
+  <div class="panel">
+    <div class="panel-hd"><h2>Sold sync</h2>
+      <span class="muted" style="flex: 1 1 360px">Every 10 minutes: car ids active on <b>{{ partners_url }}</b>,
+        checked on Encar, the sold ones sent to <span class="mono">update-car-id</span>. Hover a number for its car ids.</span>
+      <span class="muted" id="syncmsg"></span>
+      <button class="btn" id="syncdry" title="Check and record, but do not call update-car-id">Dry run</button>
+      <button class="btn primary" id="syncrun">Run now</button>
+    </div>
+    <div class="scroll">
+    {% if not rows %}<div class="empty">No sync run yet.</div>{% else %}
+      <table>
+        <thead><tr><th>#</th><th>Ran at</th><th>Source</th><th>Result</th>
+          <th class="num">Active on qa-mng</th><th class="num">Active on Encar</th>
+          <th class="num">Sold → update</th><th class="num">Not checked</th>
+          <th class="num">Took</th><th>Note</th></tr></thead>
+        <tbody>
+        {% for r in rows %}
+          <tr>
+            <td class="muted">{{ r.id }}</td>
+            <td title="{{ r.started_at|ago }}">{{ r.started_at }}</td>
+            <td>{{ r.source }}{% if r.dry_run %} <span class="tag">dry run</span>{% endif %}</td>
+            <td><span class="pill t-{{ 'ok' if r.status == 'OK' else 'sold' }}">{{ r.status }}</span></td>
+            <td class="num">{{ ids(r.checked_ids, 'Active on ' ~ (r.server or 'qa-mng')) }}</td>
+            <td class="num">{{ ids(r.active_ids, 'Still advertised on Encar') }}</td>
+            <td class="num">{{ ids(r.sold_ids, 'Sold' ~ (' — sent to update-car-id' if r.reported else ' — not sent')) }}
+              {% if r.sold_ids %}{% if r.reported %}<span class="tag stock">updated</span>
+              {% elif not r.dry_run %}<span class="tag">not sent</span>{% endif %}{% endif %}</td>
+            <td class="num">{{ ids(r.error_ids, 'Not checked — asked again next run') }}</td>
+            <td class="num">{{ r.duration_s|dur }}</td>
+            <td class="muted mono" style="white-space: normal; max-width: 280px; word-break: break-word">{{ r.note or r.update_response or '' }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+    </div>
+    {% if pages > 1 %}
+    <div class="pager">
+      {% if page > 1 %}<a class="btn" href="{{ url_with(page=page - 1) }}">← Prev</a>{% endif %}
+      <span class="muted">Page {{ page }} of {{ pages }}</span>
+      {% if page < pages %}<a class="btn" href="{{ url_with(page=page + 1) }}">Next →</a>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+  <div id="idpop"><div class="hd"><span id="idpoptitle"></span><button id="idpopcopy">Copy</button></div><ul id="idpoplist"></ul></div>
+
 {% else %}
   {# ── Crawl runs ───────────────────────────────────────────────────────── #}
   {% set parked = routes|selectattr('left')|list %}
@@ -570,6 +639,55 @@ if (checkform) {
     }
     document.getElementById('checkout').innerHTML = html + '</tbody></table>';
   });
+}
+
+// ── Sold sync ──
+const idpop = document.getElementById('idpop');
+if (idpop) {
+  const list = document.getElementById('idpoplist');
+  let hideTimer = null, current = [];
+  const show = (el) => {
+    clearTimeout(hideTimer);
+    current = JSON.parse(el.dataset.ids || '[]');
+    if (!current.length) return;
+    document.getElementById('idpoptitle').textContent = el.dataset.label + ' (' + current.length + ')';
+    list.innerHTML = current.map(id => {
+      const safe = encodeURIComponent(id);
+      return `<li><a href="https://fem.encar.com/cars/detail/${safe}" target="_blank" rel="noopener">${safe}</a></li>`;
+    }).join('');
+    idpop.classList.add('on');
+    const r = el.getBoundingClientRect(), w = idpop.offsetWidth, h = idpop.offsetHeight;
+    const left = Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8));
+    const top = r.bottom + 6 + h > window.innerHeight ? r.top - h - 6 : r.bottom + 6;
+    idpop.style.left = left + 'px'; idpop.style.top = Math.max(8, top) + 'px';
+  };
+  const hide = () => { hideTimer = setTimeout(() => idpop.classList.remove('on'), 150); };
+  document.querySelectorAll('.ids').forEach(el => {
+    el.addEventListener('mouseenter', () => show(el));
+    el.addEventListener('mouseleave', hide);
+    el.addEventListener('focus', () => show(el));
+    el.addEventListener('blur', hide);
+    el.addEventListener('click', () => show(el));  // touch screens have no hover
+  });
+  idpop.addEventListener('mouseenter', () => clearTimeout(hideTimer));
+  idpop.addEventListener('mouseleave', hide);
+  window.addEventListener('scroll', () => idpop.classList.remove('on'), {passive: true});
+  document.getElementById('idpopcopy').addEventListener('click', () =>
+    navigator.clipboard && navigator.clipboard.writeText(current.join('\n')));
+
+  const syncmsg = document.getElementById('syncmsg');
+  const runSync = async (dryRun) => {
+    if (!dryRun && !confirm('Check every car and send the sold ones to update-car-id?')) return;
+    const btns = [document.getElementById('syncdry'), document.getElementById('syncrun')];
+    btns.forEach(b => b.disabled = true);
+    syncmsg.textContent = 'Running…';
+    const data = await post('/api/sync-sold', {dryRun});
+    btns.forEach(b => b.disabled = false);
+    if (!data.ok) { syncmsg.textContent = data.message; return; }
+    location.reload();
+  };
+  document.getElementById('syncdry').addEventListener('click', () => runSync(true));
+  document.getElementById('syncrun').addEventListener('click', () => runSync(false));
 }
 
 poll();

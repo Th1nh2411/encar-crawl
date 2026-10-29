@@ -18,18 +18,20 @@ longer advertised answers 404. Nothing else comes back for it.
 
 A 404 is checked a second time after a short pause before it is reported, and
 an error (throttled, timeout, 5xx) is never read as sold: the car is simply
-asked about again on the next run. Nothing here writes to the database.
+asked about again on the next run. Every run is kept in `sync_runs` (the
+dashboard's Sold sync tab); nothing else in the database is touched.
 """
 
 from __future__ import annotations
 
+import json
 import time
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 import requests
 
+from . import store
 from .api import DETAIL_URL, Fetcher
 from .config import PARTNERS_API_URL, PARTNERS_LOCK_PATH, WORKERS
 from .crawl import crawl_lock
@@ -105,43 +107,76 @@ def check_car_ids(car_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def sync_sold(car_ids: Optional[List[str]] = None, dry_run: bool = False) -> Dict[str, Any]:
-    """One full run. `car_ids` skips the GET (for testing); `dry_run` skips the POST.
+def sync_sold(car_ids: Optional[List[str]] = None, dry_run: bool = False,
+              source: str = "manual") -> Dict[str, Any]:
+    """One full run, kept in sync_runs whatever its outcome.
 
-    Raises crawl.Locked when another run holds the lock.
+    `car_ids` skips the GET (for testing); `dry_run` skips the POST; `source`
+    is what the history shows it was started by. Raises crawl.Locked when
+    another run holds the lock.
     """
     started = time.perf_counter()
     with crawl_lock(PARTNERS_LOCK_PATH):
-        log(f"sync-sold: {datetime.now():%Y-%m-%d %H:%M:%S}")
-        log(f"Server: {urlsplit(PARTNERS_API_URL).hostname}")
-        if car_ids is None:
-            car_ids = fetch_active_car_ids()
-        log(f"Number of active stock check: {len(car_ids)}")
+        run: Dict[str, Any] = {"started_at": store.now(), "source": source,
+                               "server": urlsplit(PARTNERS_API_URL).hostname,
+                               "dry_run": int(dry_run), "status": "FAILED"}
+        try:
+            result = _run(car_ids, dry_run, run)
+            run["status"] = "OK"
+        except Exception as exc:
+            run["note"] = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            run["finished_at"] = store.now()
+            try:
+                conn = store.connect()
+                try:
+                    store.save_sync_run(conn, run)
+                finally:
+                    conn.close()
+            except Exception as exc:  # the history is a record, not the job
+                log(f"[sync-sold] could not save the run: {exc}")
 
-        states = check_car_ids(car_ids) if car_ids else {}
-        sold = [i for i in car_ids if states[i]["state"] == SOLD]
-        if sold:
-            time.sleep(CONFIRM_PAUSE)
-            again = check_car_ids(sold)
-            states.update(again)
-            sold = [i for i in sold if states[i]["state"] == SOLD]
+    result["elapsed"] = fmt_duration(time.perf_counter() - started)
+    return result
 
-        errors = [i for i in car_ids if states[i]["state"] == ERROR]
-        for i in errors:
-            log(f"    ! {i}: {states[i]['note']}")
-        log(f"After check with encar, active: {len(car_ids) - len(sold) - len(errors)}")
-        if errors:
-            log(f"Could not check (asked again next run): {len(errors)}")
-        log(f"Will be update to sold: {len(sold)}")
-        if sold:
-            log(f"listSoldCarId = {sold}")
 
-        response = None
-        if sold and not dry_run:
-            response = report_sold(sold)
-            log(f"[sync-sold] update-car-id <- {response}")
-        elif sold:
-            log("[sync-sold] dry run: update-car-id not called")
+def _run(car_ids: Optional[List[str]], dry_run: bool, run: Dict[str, Any]) -> Dict[str, Any]:
+    """The run itself; fills `run` as it goes, so a failure keeps what was known."""
+    log(f"sync-sold: {run['started_at']}")
+    log(f"Server: {run['server']}")
+    if car_ids is None:
+        car_ids = fetch_active_car_ids()
+    run["checked_ids"] = car_ids
+    log(f"Number of active stock check: {len(car_ids)}")
+
+    states = check_car_ids(car_ids) if car_ids else {}
+    sold = [i for i in car_ids if states[i]["state"] == SOLD]
+    if sold:
+        time.sleep(CONFIRM_PAUSE)
+        states.update(check_car_ids(sold))
+        sold = [i for i in sold if states[i]["state"] == SOLD]
+
+    errors = [i for i in car_ids if states[i]["state"] == ERROR]
+    active = [i for i in car_ids if states[i]["state"] == ACTIVE]
+    run.update(active_ids=active, sold_ids=sold, error_ids=errors)
+    for i in errors:
+        log(f"    ! {i}: {states[i]['note']}")
+    log(f"After check with encar, active: {len(active)}")
+    if errors:
+        log(f"Could not check (asked again next run): {len(errors)}")
+    log(f"Will be update to sold: {len(sold)}")
+    if sold:
+        log(f"listSoldCarId = {sold}")
+
+    response = None
+    if sold and not dry_run:
+        response = report_sold(sold)
+        run.update(reported=1, update_response=json.dumps(response, ensure_ascii=False)
+                   if not isinstance(response, str) else response)
+        log(f"[sync-sold] update-car-id <- {response}")
+    elif sold:
+        log("[sync-sold] dry run: update-car-id not called")
 
     return {
         "checked": len(car_ids),
@@ -151,5 +186,4 @@ def sync_sold(car_ids: Optional[List[str]] = None, dry_run: bool = False) -> Dic
         "reported": bool(sold) and not dry_run,
         "updateResponse": response,
         "dryRun": dry_run,
-        "elapsed": fmt_duration(time.perf_counter() - started),
     }
