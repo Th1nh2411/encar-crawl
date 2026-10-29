@@ -24,6 +24,7 @@ asked about again on the next run. Nothing here writes to the database.
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
@@ -111,6 +112,7 @@ def sync_sold(car_ids: Optional[List[str]] = None, dry_run: bool = False) -> Dic
     """
     started = time.perf_counter()
     with crawl_lock(PARTNERS_LOCK_PATH):
+        log(f"sync-sold: {datetime.now():%Y-%m-%d %H:%M:%S}")
         log(f"Server: {urlsplit(PARTNERS_API_URL).hostname}")
         if car_ids is None:
             car_ids = fetch_active_car_ids()
