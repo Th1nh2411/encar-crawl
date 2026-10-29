@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import requests
 
@@ -110,11 +111,10 @@ def sync_sold(car_ids: Optional[List[str]] = None, dry_run: bool = False) -> Dic
     """
     started = time.perf_counter()
     with crawl_lock(PARTNERS_LOCK_PATH):
+        log(f"Server: {urlsplit(PARTNERS_API_URL).hostname}")
         if car_ids is None:
             car_ids = fetch_active_car_ids()
-            log(f"[sync-sold] {len(car_ids)} active car id(s) from partners-stock")
-        else:
-            log(f"[sync-sold] {len(car_ids)} car id(s) given")
+        log(f"Number of active stock check: {len(car_ids)}")
 
         states = check_car_ids(car_ids) if car_ids else {}
         sold = [i for i in car_ids if states[i]["state"] == SOLD]
@@ -127,9 +127,12 @@ def sync_sold(car_ids: Optional[List[str]] = None, dry_run: bool = False) -> Dic
         errors = [i for i in car_ids if states[i]["state"] == ERROR]
         for i in errors:
             log(f"    ! {i}: {states[i]['note']}")
-        log(f"[sync-sold] listSoldCarId = {sold}")
-        log(f"[sync-sold] active {len(car_ids) - len(sold) - len(errors)} | "
-            f"sold {len(sold)} | errors {len(errors)}")
+        log(f"After check with encar, active: {len(car_ids) - len(sold) - len(errors)}")
+        if errors:
+            log(f"Could not check (asked again next run): {len(errors)}")
+        log(f"Will be update to sold: {len(sold)}")
+        if sold:
+            log(f"listSoldCarId = {sold}")
 
         response = None
         if sold and not dry_run:
