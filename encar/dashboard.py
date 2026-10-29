@@ -16,7 +16,7 @@ else is a closer look at a row of it:
     /check            live "is this plate on sale" lookup
     /sync             sync-sold history: every cron / manual run, with its car ids
 
-    POST /api/sync-sold   one partners-stock sold sync by hand (partners.py)
+    POST /api/sync-sold[-test|-live]   one sold sync by hand: QA, TEST, LIVE (partners.py)
 
 Everything is driven from here -- there is no scheduled crawl:
 
@@ -285,7 +285,7 @@ def runs():
 
 @app.route("/sync")
 def sync_runs():
-    from .config import PARTNERS_API_URL
+    from .config import PARTNERS_SERVERS
 
     page = page_arg()
     conn = db()
@@ -305,7 +305,7 @@ def sync_runs():
                 r[key] = None
     return render_template(
         "index.html", view="sync", rows=rows, total=total, page=page,
-        pages=max(1, math.ceil(total / PAGE_SIZE)), partners_url=PARTNERS_API_URL,
+        pages=max(1, math.ceil(total / PAGE_SIZE)), partner_servers=PARTNERS_SERVERS,
         status_meta=STATUS, filters={}, **header())
 
 
@@ -437,15 +437,19 @@ def api_check_plate():
     return jsonify({"ok": True, "results": results})
 
 
-@app.post("/api/sync-sold")
-def api_sync_sold():
-    """One sync-sold run, by hand: what the 10-minute schedule does.
+@app.post("/api/sync-sold", defaults={"server": "QA"})
+@app.post("/api/sync-sold-test", defaults={"server": "TEST"})
+@app.post("/api/sync-sold-live", defaults={"server": "LIVE"})
+def api_sync_sold(server: str):
+    """One sync-sold run against one server, by hand: what the 10-minute schedule does.
 
+    /api/sync-sold is QA, /api/sync-sold-test TEST, /api/sync-sold-live LIVE
+    (refused while LIVE is commented out in config.PARTNERS_SERVERS).
     Body: {"dryRun": true} to skip update-car-id; {"carIds": [...]} to check
     these ids instead of asking partners-stock.
     """
     from .crawl import Locked
-    from .partners import sync_sold
+    from .partners import UnknownServer, sync_sold
 
     body = json_body()
     if body is None:
@@ -458,9 +462,12 @@ def api_sync_sold():
             return jsonify({"ok": False,
                             "message": f"At most {CHECK_MAX} car ids at a time"}), 400
     try:
-        result = sync_sold(car_ids, dry_run=bool(body.get("dryRun")))
+        result = sync_sold(server, car_ids, dry_run=bool(body.get("dryRun")))
+    except UnknownServer as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
     except Locked:
-        return jsonify({"ok": False, "message": "A sync-sold run is already going"}), 409
+        return jsonify({"ok": False,
+                        "message": f"A {server} sync-sold run is already going"}), 409
     except Exception as exc:
         return jsonify({"ok": False, "message": f"{type(exc).__name__}: {exc}"}), 502
     return jsonify({"ok": True, **result})

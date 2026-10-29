@@ -168,21 +168,28 @@ def cmd_import_stock(args) -> int:
 
 
 def cmd_sync_sold(args) -> int:
+    from .config import PARTNERS_SERVERS
     from .crawl import Locked
     from .partners import sync_sold
 
     if args.log_file:
         setup_file_log(args.log_file)
-    try:
-        result = sync_sold(args.car_ids or None, dry_run=args.dry_run, source="cron")
-    except Locked as exc:
-        log(f"{exc} -- exiting.")
-        return 2
-    except Exception as exc:  # the schedule only sees the exit code and the log
-        log(f"[sync-sold] FAILED: {type(exc).__name__}: {exc}")
-        return 1
-    log(f"[sync-sold] done in {result['elapsed']}")
-    return 0
+    servers = [s.upper() for s in args.servers] or list(PARTNERS_SERVERS)
+    failed = False
+    # One server at a time; one that fails does not keep the others from running.
+    for server in servers:
+        try:
+            result = sync_sold(server, args.car_ids or None, dry_run=args.dry_run,
+                               source="cron")
+        except Locked as exc:
+            log(f"[sync-sold] {server}: {exc} -- skipped")
+            continue
+        except Exception as exc:  # the schedule only sees the exit code and the log
+            log(f"[sync-sold] {server} FAILED: {type(exc).__name__}: {exc}")
+            failed = True
+            continue
+        log(f"[sync-sold] {server} done in {result['elapsed']}")
+    return 1 if failed else 0
 
 
 def cmd_dashboard(args) -> int:
@@ -288,6 +295,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # sync-sold
     s = sub.add_parser("sync-sold", help="report partners-stock cars sold on Encar")
+    s.add_argument("--server", dest="servers", action="append", default=[],
+                   help="QA, TEST or LIVE, repeatable (default: every server enabled "
+                        "in config.PARTNERS_SERVERS)")
     s.add_argument("--car-id", dest="car_ids", action="append", default=[],
                    help="check this car id instead of asking partners-stock, repeatable")
     s.add_argument("--dry-run", action="store_true",

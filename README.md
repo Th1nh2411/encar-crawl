@@ -138,13 +138,20 @@ To resolve the stock's 미확인 cars, add their models (Korean makes need
 
 ## Partners stock sold sync (every 10 minutes)
 
-    python main.py sync-sold                    # one run
+    python main.py sync-sold                    # one run, every enabled server
+    python main.py sync-sold --server TEST      # one server only
     python main.py sync-sold --dry-run          # check and log, POST nothing
     python main.py sync-sold --car-id 42229086 --dry-run
 
-One run ([`partners.py`](encar/partners.py)): `GET <PARTNERS_API_URL>/active-car-id`,
+Servers: QA (`PARTNERS_API_URL`), TEST (`PARTNERS_TEST_API_URL`) and LIVE
+(`PARTNERS_LIVE_API_URL`), listed in `PARTNERS_SERVERS` in
+[`config.py`](encar/config.py). **LIVE is commented out there** and is never
+called -- not by the cron, not by its endpoint -- until those lines are
+uncommented and the processes restarted.
+
+One run per server ([`partners.py`](encar/partners.py)): `GET <url>/active-car-id`,
 then the Encar detail endpoint for every `carid`, then
-`POST <PARTNERS_API_URL>/update-car-id` with `{"carIds": [...]}` for the sold
+`POST <url>/update-car-id` with `{"carIds": [...]}` for the sold
 ones (`listSoldCarId` in the log). Sold = Encar answers 404 for the listing,
 confirmed by a second ask 5s later; a block or timeout is never read as sold.
 Log: `logs/sync-sold.log`. One run at a time (`var/sync-sold.lock`).
@@ -161,6 +168,7 @@ By hand through the dashboard (same login as the UI):
     curl -u admin:$PASS -X POST http://<host>:9191/api/sync-sold \
          -H 'Content-Type: application/json' -d '{"dryRun": true}'
     # or {"carIds": ["42229086"], "dryRun": true} to check given ids only
+    # /api/sync-sold = QA, /api/sync-sold-test = TEST, /api/sync-sold-live = LIVE
 
 ## The dashboard
 

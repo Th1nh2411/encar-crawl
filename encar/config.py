@@ -41,10 +41,21 @@ LOCK_PATH = os.path.join(VAR_DIR, "crawl.lock")
 LOG_PATH = _path("LOG_FILE", os.path.join("logs", "encar.log"))
 
 # ── Partners stock (sync-sold) ────────────────────────────────────────────────
-# The service whose Encar car ids are checked every 10 minutes; see partners.py.
-PARTNERS_API_URL = (os.getenv("PARTNERS_API_URL")
-                    or "https://qa-mng.702prime.com/api/partners-stock").rstrip("/")
-PARTNERS_LOCK_PATH = os.path.join(VAR_DIR, "sync-sold.lock")
+# The services whose Encar car ids are checked every 10 minutes; see partners.py.
+# The cron run syncs every server listed here, in this order; a server that is
+# not listed is never called, by the cron or by its /api/sync-sold-* endpoint.
+PARTNERS_SERVERS = {
+    "QA": os.getenv("PARTNERS_API_URL")
+          or "https://qa-mng.702prime.com/api/partners-stock",
+    "TEST": os.getenv("PARTNERS_TEST_API_URL")
+            or "https://test-mng.702prime.com/api/partners-stock",
+    # LIVE is off until it is deployed for the customer. To turn it on,
+    # uncomment these two lines and restart (pm2 restart encar-dashboard).
+    # "LIVE": os.getenv("PARTNERS_LIVE_API_URL")
+    #         or "https://mng.702prime.com/api/partners-stock",
+}
+PARTNERS_SERVERS = {name: url.rstrip("/") for name, url in PARTNERS_SERVERS.items()}
+PARTNERS_LOCK_PATH = os.path.join(VAR_DIR, "sync-sold-{server}.lock")
 PARTNERS_LOG_PATH = _path("PARTNERS_LOG_FILE", os.path.join("logs", "sync-sold.log"))
 
 # The JSON cache the file-only exporter used to keep. Read once into the

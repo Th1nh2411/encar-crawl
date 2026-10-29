@@ -431,17 +431,21 @@
   {% endmacro %}
   <div class="panel">
     <div class="panel-hd"><h2>Sold sync</h2>
-      <span class="muted" style="flex: 1 1 360px">Every 10 minutes: car ids active on <b>{{ partners_url }}</b>,
-        checked on Encar, the sold ones sent to <span class="mono">update-car-id</span>. Hover a number for its car ids.</span>
+      <span class="muted" style="flex: 1 1 360px">Every 10 minutes, for each of
+        <b>{{ partner_servers|join(', ') }}</b>: car ids active there, checked on Encar, the sold ones sent
+        to <span class="mono">update-car-id</span>. Hover a number for its car ids.</span>
       <span class="muted" id="syncmsg"></span>
+      <select id="syncserver" title="Server to run against">
+        {% for name, url in partner_servers.items() %}<option value="{{ name }}" title="{{ url }}">{{ name }}</option>{% endfor %}
+      </select>
       <button class="btn" id="syncdry" title="Check and record, but do not call update-car-id">Dry run</button>
       <button class="btn primary" id="syncrun">Run now</button>
     </div>
     <div class="scroll">
     {% if not rows %}<div class="empty">No sync run yet.</div>{% else %}
       <table>
-        <thead><tr><th>#</th><th>Ran at</th><th>Source</th><th>Result</th>
-          <th class="num">Active on qa-mng</th><th class="num">Active on Encar</th>
+        <thead><tr><th>#</th><th>Ran at</th><th>Server</th><th>Source</th><th>Result</th>
+          <th class="num">Active on server</th><th class="num">Active on Encar</th>
           <th class="num">Sold → update</th><th class="num">Not checked</th>
           <th class="num">Took</th><th>Note</th></tr></thead>
         <tbody>
@@ -449,6 +453,7 @@
           <tr>
             <td class="muted">{{ r.id }}</td>
             <td title="{{ r.started_at|ago }}">{{ r.started_at }}</td>
+            <td title="{{ r.server or '' }}">{% if r.target %}<span class="pill t-{{ {'QA': 'plain', 'TEST': 'warn', 'LIVE': 'ok'}.get(r.target, 'plain') }}">{{ r.target }}</span>{% else %}<span class="faint">—</span>{% endif %}</td>
             <td>{{ r.source }}{% if r.dry_run %} <span class="tag">dry run</span>{% endif %}</td>
             <td><span class="pill t-{{ 'ok' if r.status == 'OK' else 'sold' }}">{{ r.status }}</span></td>
             <td class="num">{{ ids(r.checked_ids, 'Active on ' ~ (r.server or 'qa-mng')) }}</td>
@@ -677,11 +682,12 @@ if (idpop) {
 
   const syncmsg = document.getElementById('syncmsg');
   const runSync = async (dryRun) => {
-    if (!dryRun && !confirm('Check every car and send the sold ones to update-car-id?')) return;
+    const server = document.getElementById('syncserver').value;
+    if (!dryRun && !confirm('Check every ' + server + ' car and send the sold ones to update-car-id on ' + server + '?')) return;
     const btns = [document.getElementById('syncdry'), document.getElementById('syncrun')];
     btns.forEach(b => b.disabled = true);
     syncmsg.textContent = 'Running…';
-    const data = await post('/api/sync-sold', {dryRun});
+    const data = await post({QA: '/api/sync-sold', TEST: '/api/sync-sold-test', LIVE: '/api/sync-sold-live'}[server], {dryRun});
     btns.forEach(b => b.disabled = false);
     if (!data.ok) { syncmsg.textContent = data.message; return; }
     location.reload();

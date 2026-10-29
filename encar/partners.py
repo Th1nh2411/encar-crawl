@@ -2,14 +2,16 @@
 partners.py -- Tell the partners-stock service which of its Encar cars are sold.
 
     python main.py sync-sold                 # what the 10-minute schedule runs
+    python main.py sync-sold --server TEST   # one server only
     python main.py sync-sold --dry-run       # check, log, but POST nothing
     python main.py sync-sold --car-id 42229086 --dry-run
 
-One run:
+The servers are config.PARTNERS_SERVERS (QA, TEST, LIVE -- LIVE commented out
+until it is deployed). One run is one server:
 
-    GET  <PARTNERS_API_URL>/active-car-id     the car ids it still shows as live
+    GET  <server url>/active-car-id     the car ids it still shows as live
     GET  api.encar.com/v1/readside/vehicle/<id>?include=ADVERTISEMENT   per car
-    POST <PARTNERS_API_URL>/update-car-id     {"carIds": [...the sold ones]}
+    POST <server url>/update-car-id     {"carIds": [...the sold ones]}
 
 What "sold" means, as measured against the live API: a listing that is still
 advertised answers 200 with `advertisement.status = "ADVERTISE"` (one under
@@ -33,7 +35,7 @@ import requests
 
 from . import store
 from .api import DETAIL_URL, Fetcher
-from .config import PARTNERS_API_URL, PARTNERS_LOCK_PATH, WORKERS
+from .config import PARTNERS_LOCK_PATH, PARTNERS_SERVERS, WORKERS
 from .crawl import crawl_lock
 from .log import fmt_duration, log
 from .plates import transports
@@ -59,7 +61,7 @@ def verdict(result: Result) -> str:
     return ACTIVE if ad.get("status") == "ADVERTISE" else SOLD
 
 
-def fetch_active_car_ids(base_url: str = PARTNERS_API_URL) -> List[str]:
+def fetch_active_car_ids(base_url: str) -> List[str]:
     """The car ids the partners service still shows, in its order, deduplicated."""
     resp = requests.get(f"{base_url}/active-car-id", timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
@@ -70,7 +72,7 @@ def fetch_active_car_ids(base_url: str = PARTNERS_API_URL) -> List[str]:
     return list(dict.fromkeys(i for i in ids if i))
 
 
-def report_sold(car_ids: List[str], base_url: str = PARTNERS_API_URL) -> Any:
+def report_sold(car_ids: List[str], base_url: str) -> Any:
     resp = requests.post(f"{base_url}/update-car-id", json={"carIds": car_ids},
                          timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
@@ -107,24 +109,40 @@ def check_car_ids(car_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def sync_sold(car_ids: Optional[List[str]] = None, dry_run: bool = False,
-              source: str = "manual") -> Dict[str, Any]:
-    """One full run, kept in sync_runs whatever its outcome.
+def error_note(exc: Exception) -> str:
+    """Short enough for the history table: 'HTTP 401 on /api/.../active-car-id'."""
+    resp = getattr(exc, "response", None)
+    if isinstance(exc, requests.HTTPError) and resp is not None:
+        return f"HTTP {resp.status_code} on {urlsplit(resp.url).path}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+class UnknownServer(ValueError):
+    pass
+
+
+def sync_sold(server: str = "QA", car_ids: Optional[List[str]] = None,
+              dry_run: bool = False, source: str = "manual") -> Dict[str, Any]:
+    """One full run against one server, kept in sync_runs whatever its outcome.
 
     `car_ids` skips the GET (for testing); `dry_run` skips the POST; `source`
-    is what the history shows it was started by. Raises crawl.Locked when
-    another run holds the lock.
+    is what the history shows it was started by. Raises UnknownServer for a
+    server not in PARTNERS_SERVERS (LIVE while it is commented out), and
+    crawl.Locked when another run against the same server holds its lock.
     """
+    if server not in PARTNERS_SERVERS:
+        raise UnknownServer(f"{server} is not enabled in config.PARTNERS_SERVERS")
+    base_url = PARTNERS_SERVERS[server]
     started = time.perf_counter()
-    with crawl_lock(PARTNERS_LOCK_PATH):
+    with crawl_lock(PARTNERS_LOCK_PATH.format(server=server.lower())):
         run: Dict[str, Any] = {"started_at": store.now(), "source": source,
-                               "server": urlsplit(PARTNERS_API_URL).hostname,
+                               "target": server, "server": urlsplit(base_url).hostname,
                                "dry_run": int(dry_run), "status": "FAILED"}
         try:
-            result = _run(car_ids, dry_run, run)
+            result = _run(base_url, car_ids, dry_run, run)
             run["status"] = "OK"
         except Exception as exc:
-            run["note"] = f"{type(exc).__name__}: {exc}"
+            run["note"] = error_note(exc)
             raise
         finally:
             run["finished_at"] = store.now()
@@ -141,12 +159,13 @@ def sync_sold(car_ids: Optional[List[str]] = None, dry_run: bool = False,
     return result
 
 
-def _run(car_ids: Optional[List[str]], dry_run: bool, run: Dict[str, Any]) -> Dict[str, Any]:
+def _run(base_url: str, car_ids: Optional[List[str]], dry_run: bool,
+         run: Dict[str, Any]) -> Dict[str, Any]:
     """The run itself; fills `run` as it goes, so a failure keeps what was known."""
     log(f"sync-sold: {run['started_at']}")
     log(f"Server: {run['server']}")
     if car_ids is None:
-        car_ids = fetch_active_car_ids()
+        car_ids = fetch_active_car_ids(base_url)
     run["checked_ids"] = car_ids
     log(f"Number of active stock check: {len(car_ids)}")
 
@@ -171,7 +190,7 @@ def _run(car_ids: Optional[List[str]], dry_run: bool, run: Dict[str, Any]) -> Di
 
     response = None
     if sold and not dry_run:
-        response = report_sold(sold)
+        response = report_sold(sold, base_url)
         run.update(reported=1, update_response=json.dumps(response, ensure_ascii=False)
                    if not isinstance(response, str) else response)
         log(f"[sync-sold] update-car-id <- {response}")
@@ -179,6 +198,7 @@ def _run(car_ids: Optional[List[str]], dry_run: bool, run: Dict[str, Any]) -> Di
         log("[sync-sold] dry run: update-car-id not called")
 
     return {
+        "server": run["target"],
         "checked": len(car_ids),
         "listSoldCarId": sold,
         "errors": {i: states[i]["note"] for i in errors},

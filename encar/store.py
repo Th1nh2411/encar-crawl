@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     started_at      TEXT NOT NULL,
     finished_at     TEXT,
     source          TEXT NOT NULL,              -- cron (main.py) / manual (dashboard API)
+    target          TEXT,                       -- QA / TEST / LIVE
     server          TEXT,                       -- partners-stock host
     dry_run         INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL CHECK (status IN ('OK', 'FAILED')),
@@ -243,7 +244,18 @@ def connect(path: str = DB_PATH) -> sqlite3.Connection:
     # WAL lets the dashboard read while a crawl writes.
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    migrate(conn)
     return conn
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Columns added after a table was first created, which CREATE IF NOT EXISTS skips."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sync_runs)")}
+    if "target" not in cols:
+        conn.execute("ALTER TABLE sync_runs ADD COLUMN target TEXT")
+        # Every run before servers were named was against QA.
+        conn.execute("UPDATE sync_runs SET target = 'QA'")
+        conn.commit()
 
 
 # ── Car numbers already known ─────────────────────────────────────────────────
