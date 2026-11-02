@@ -51,7 +51,7 @@ module.exports = {
         PYTHONUNBUFFERED: "1",
       },
     },
-    // Every 10 minutes: partners-stock car ids -> Encar -> update-car-id for
+    // Every 2 hours: partners-stock car ids -> Encar -> update-car-id for
     // the sold ones (encar/partners.py). A one-shot run, so PM2 must not
     // restart it when it exits; cron_restart starts it again. Log:
     // logs/sync-sold.log (and `pm2 logs encar-sync-sold`).
@@ -63,7 +63,7 @@ module.exports = {
       interpreter: "none",
       exec_mode: "fork",
       instances: 1,
-      cron_restart: "*/10 * * * *",
+      cron_restart: "0 */2 * * *",
       autorestart: false,
       env: {
         PYTHONUNBUFFERED: "1",

@@ -136,7 +136,7 @@ To resolve the stock's 미확인 cars, add their models (Korean makes need
 
 `var/`, `output/` and `logs/` are not tracked in git.
 
-## Partners stock sold sync (every 10 minutes)
+## Partners stock sold sync (every 2 hours)
 
     python main.py sync-sold                    # one run, every enabled server
     python main.py sync-sold --server TEST      # one server only
@@ -145,9 +145,9 @@ To resolve the stock's 미확인 cars, add their models (Korean makes need
 
 Servers: QA (`PARTNERS_API_URL`), TEST (`PARTNERS_TEST_API_URL`) and LIVE
 (`PARTNERS_LIVE_API_URL`), listed in `PARTNERS_SERVERS` in
-[`config.py`](encar/config.py). **LIVE is commented out there** and is never
-called -- not by the cron, not by its endpoint -- until those lines are
-uncommented and the processes restarted.
+[`config.py`](encar/config.py). A server commented out there is never
+called -- not by the cron, not by its endpoint -- until it is uncommented and
+the processes restarted.
 
 One run per server ([`partners.py`](encar/partners.py)): `GET <url>/active-car-id`,
 then the Encar detail endpoint for every `carid`, then
@@ -159,9 +159,9 @@ Every run, cron or manual, is kept in the `sync_runs` table and shown on the
 dashboard's **Sold sync** tab (hover a count for its car ids).
 
 Scheduled by PM2 as `encar-sync-sold` in `deploy/ecosystem.config.js`
-(`cron_restart: */10`). Without PM2, a crontab line does the same:
+(`cron_restart: 0 */2 * * *`). Without PM2, a crontab line does the same:
 
-    */10 * * * * cd /opt/encar-crawl && .venv/bin/python main.py sync-sold >/dev/null 2>&1
+    0 */2 * * * cd /opt/encar-crawl && .venv/bin/python main.py sync-sold >/dev/null 2>&1
 
 By hand through the dashboard (same login as the UI):
 

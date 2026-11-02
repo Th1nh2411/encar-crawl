@@ -441,10 +441,10 @@ def api_check_plate():
 @app.post("/api/sync-sold-test", defaults={"server": "TEST"})
 @app.post("/api/sync-sold-live", defaults={"server": "LIVE"})
 def api_sync_sold(server: str):
-    """One sync-sold run against one server, by hand: what the 10-minute schedule does.
+    """One sync-sold run against one server, by hand: what the 2-hour schedule does.
 
     /api/sync-sold is QA, /api/sync-sold-test TEST, /api/sync-sold-live LIVE
-    (refused while LIVE is commented out in config.PARTNERS_SERVERS).
+    (refused for a server commented out in config.PARTNERS_SERVERS).
     Body: {"dryRun": true} to skip update-car-id; {"carIds": [...]} to check
     these ids instead of asking partners-stock.
     """

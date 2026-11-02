@@ -1,13 +1,13 @@
 """
 partners.py -- Tell the partners-stock service which of its Encar cars are sold.
 
-    python main.py sync-sold                 # what the 10-minute schedule runs
+    python main.py sync-sold                 # what the 2-hour schedule runs
     python main.py sync-sold --server TEST   # one server only
     python main.py sync-sold --dry-run       # check, log, but POST nothing
     python main.py sync-sold --car-id 42229086 --dry-run
 
-The servers are config.PARTNERS_SERVERS (QA, TEST, LIVE -- LIVE commented out
-until it is deployed). One run is one server:
+The servers are config.PARTNERS_SERVERS (QA, TEST, LIVE; comment one out
+there to stop calling it). One run is one server:
 
     GET  <server url>/active-car-id     the car ids it still shows as live
     GET  api.encar.com/v1/readside/vehicle/<id>?include=ADVERTISEMENT   per car
