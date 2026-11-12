@@ -155,8 +155,19 @@ then the Encar detail endpoint for every `carid`, then
 ones (`listSoldCarId` in the log). Sold = Encar answers 404 for the listing,
 confirmed by a second ask 5s later; a block or timeout is never read as sold.
 Log: `logs/sync-sold.log`. One run at a time (`var/sync-sold.lock`).
-Every run, cron or manual, is kept in the `sync_runs` table and shown on the
-dashboard's **Sold sync** tab (hover a count for its car ids).
+**Recheck**, 15 minutes after each sync (`main.py recheck-sold`, PM2 app
+`encar-recheck-sold`, `cron_restart: 15 */2 * * *`): Encar under maintenance
+can look as if every car were gone, so the cars reported sold
+(`GET <url>/pending-sold-car-id`) are checked on Encar again, and the ones
+still advertised go back with `POST <url>/update-active-car-id`
+`{"carIds": [...]}`. A 404 or an error leaves a car as it is. Only the servers
+in `PARTNERS_RECHECK_SERVERS` (`config.py`) are rechecked -- LIVE is commented
+out there until the customer's server has the endpoints. By hand:
+`/api/recheck-sold`, `/api/recheck-sold-test`, `/api/recheck-sold-live`.
+
+Every run, cron or manual, sync or recheck, is kept in the `sync_runs` table
+and shown on the dashboard's **Sold sync** tab -- switch between *Sold sync*
+and *Re-check*, filter by server, hover a count for its car ids.
 
 Scheduled by PM2 as `encar-sync-sold` in `deploy/ecosystem.config.js`
 (`cron_restart: 0 */2 * * *`). Without PM2, a crontab line does the same:

@@ -6,6 +6,7 @@ cli.py -- `python main.py <command>`.
     check-plate  live "is this plate on sale" lookup, shown next to the database
     import-stock sonokong dumps in data/ -> database
     sync-sold    partners-stock car ids -> Encar -> report the sold ones back
+    recheck-sold the cars reported sold -> Encar -> put the live ones back
     dashboard    the web UI over the database
 
 With no command, `crawl` is assumed: `python main.py --model x` still works.
@@ -23,7 +24,8 @@ from typing import List, Optional
 from .config import DATA_DIR, DB_PATH, ROOT_DIR
 from .log import log, setup_file_log
 
-COMMANDS = ("crawl", "export", "check-plate", "import-stock", "sync-sold", "dashboard")
+COMMANDS = ("crawl", "export", "check-plate", "import-stock", "sync-sold",
+            "recheck-sold", "dashboard")
 
 
 def parse_pages(text: str) -> Optional[List[int]]:
@@ -168,27 +170,29 @@ def cmd_import_stock(args) -> int:
 
 
 def cmd_sync_sold(args) -> int:
-    from .config import PARTNERS_SERVERS
+    """sync-sold and recheck-sold: the same loop over servers, another job."""
+    from .config import PARTNERS_RECHECK_SERVERS, PARTNERS_SERVERS
     from .crawl import Locked
-    from .partners import sync_sold
+    from .partners import recheck_sold, sync_sold
 
     if args.log_file:
         setup_file_log(args.log_file)
-    servers = [s.upper() for s in args.servers] or list(PARTNERS_SERVERS)
+    job, enabled = ((sync_sold, list(PARTNERS_SERVERS)) if args.command == "sync-sold"
+                    else (recheck_sold, PARTNERS_RECHECK_SERVERS))
+    servers = [s.upper() for s in args.servers] or enabled
     failed = False
     # One server at a time; one that fails does not keep the others from running.
     for server in servers:
         try:
-            result = sync_sold(server, args.car_ids or None, dry_run=args.dry_run,
-                               source="cron")
+            result = job(server, args.car_ids or None, dry_run=args.dry_run, source="cron")
         except Locked as exc:
-            log(f"[sync-sold] {server}: {exc} -- skipped")
+            log(f"[{args.command}] {server}: {exc} -- skipped")
             continue
         except Exception as exc:  # the schedule only sees the exit code and the log
-            log(f"[sync-sold] {server} FAILED: {type(exc).__name__}: {exc}")
+            log(f"[{args.command}] {server} FAILED: {type(exc).__name__}: {exc}")
             failed = True
             continue
-        log(f"[sync-sold] {server} done in {result['elapsed']}")
+        log(f"[{args.command}] {server} done in {result['elapsed']}")
     return 1 if failed else 0
 
 
@@ -293,19 +297,23 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--dry-run", action="store_true", help="parse and report only")
     i.set_defaults(func=cmd_import_stock)
 
-    # sync-sold
-    s = sub.add_parser("sync-sold", help="report partners-stock cars sold on Encar")
-    s.add_argument("--server", dest="servers", action="append", default=[],
-                   help="QA, TEST or LIVE, repeatable (default: every server enabled "
-                        "in config.PARTNERS_SERVERS)")
-    s.add_argument("--car-id", dest="car_ids", action="append", default=[],
-                   help="check this car id instead of asking partners-stock, repeatable")
-    s.add_argument("--dry-run", action="store_true",
-                   help="check and log, but do not call update-car-id")
-    s.add_argument("--log-file", default=PARTNERS_LOG_PATH,
-                   help="also append the log here (default: logs/sync-sold.log; "
-                        "'' for none)")
-    s.set_defaults(func=cmd_sync_sold)
+    # sync-sold / recheck-sold
+    for name, helptext, post in (
+            ("sync-sold", "report partners-stock cars sold on Encar", "update-car-id"),
+            ("recheck-sold", "put back reported-sold cars Encar still advertises",
+             "update-active-car-id")):
+        s = sub.add_parser(name, help=helptext)
+        s.add_argument("--server", dest="servers", action="append", default=[],
+                       help="QA, TEST or LIVE, repeatable (default: every server "
+                            "enabled for it in encar/config.py)")
+        s.add_argument("--car-id", dest="car_ids", action="append", default=[],
+                       help="check this car id instead of asking partners-stock, repeatable")
+        s.add_argument("--dry-run", action="store_true",
+                       help=f"check and log, but do not call {post}")
+        s.add_argument("--log-file", default=PARTNERS_LOG_PATH,
+                       help="also append the log here (default: logs/sync-sold.log; "
+                            "'' for none)")
+        s.set_defaults(func=cmd_sync_sold)
 
     # dashboard
     d = sub.add_parser("dashboard", help="run the web UI")

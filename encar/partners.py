@@ -2,16 +2,30 @@
 partners.py -- Tell the partners-stock service which of its Encar cars are sold.
 
     python main.py sync-sold                 # what the 2-hour schedule runs
+    python main.py recheck-sold              # the same schedule, 15 minutes later
     python main.py sync-sold --server TEST   # one server only
     python main.py sync-sold --dry-run       # check, log, but POST nothing
     python main.py sync-sold --car-id 42229086 --dry-run
 
 The servers are config.PARTNERS_SERVERS (QA, TEST, LIVE; comment one out
-there to stop calling it). One run is one server:
+there to stop calling it). One run is one server.
+
+sync-sold -- report the cars that are gone:
 
     GET  <server url>/active-car-id     the car ids it still shows as live
     GET  api.encar.com/v1/readside/vehicle/<id>?include=ADVERTISEMENT   per car
     POST <server url>/update-car-id     {"carIds": [...the sold ones]}
+
+recheck-sold -- take back a sold report that was wrong. Encar under
+maintenance can answer as if every car were gone; 15 minutes later the cars
+reported sold are asked about again, and any that is advertised after all goes
+back to active:
+
+    GET  <server url>/pending-sold-car-id     the car ids reported sold
+    GET  api.encar.com/...                    per car, as above
+    POST <server url>/update-active-car-id    {"carIds": [...the live ones]}
+
+Only the servers in config.PARTNERS_RECHECK_SERVERS are rechecked.
 
 What "sold" means, as measured against the live API: a listing that is still
 advertised answers 200 with `advertisement.status = "ADVERTISE"` (one under
@@ -20,8 +34,9 @@ longer advertised answers 404. Nothing else comes back for it.
 
 A 404 is checked a second time after a short pause before it is reported, and
 an error (throttled, timeout, 5xx) is never read as sold: the car is simply
-asked about again on the next run. Every run is kept in `sync_runs` (the
-dashboard's Sold sync tab); nothing else in the database is touched.
+asked about again on the next run. Every run, of either kind, is kept in
+`sync_runs` (the dashboard's Sold sync tab); nothing else in the database is
+touched.
 """
 
 from __future__ import annotations
@@ -35,7 +50,7 @@ import requests
 
 from . import store
 from .api import DETAIL_URL, Fetcher
-from .config import PARTNERS_LOCK_PATH, PARTNERS_SERVERS, WORKERS
+from .config import PARTNERS_LOCK_PATH, PARTNERS_RECHECK_SERVERS, PARTNERS_SERVERS, WORKERS
 from .crawl import crawl_lock
 from .log import fmt_duration, log
 from .plates import transports
@@ -61,19 +76,19 @@ def verdict(result: Result) -> str:
     return ACTIVE if ad.get("status") == "ADVERTISE" else SOLD
 
 
-def fetch_active_car_ids(base_url: str) -> List[str]:
-    """The car ids the partners service still shows, in its order, deduplicated."""
-    resp = requests.get(f"{base_url}/active-car-id", timeout=HTTP_TIMEOUT)
+def fetch_car_ids(base_url: str, path: str) -> List[str]:
+    """`{"success": true, "data": [{"carid": ...}]}` -> the car ids, in order, deduplicated."""
+    resp = requests.get(f"{base_url}/{path}", timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     body = resp.json()
     if not body.get("success"):
-        raise RuntimeError(f"active-car-id answered success=false: {body}")
+        raise RuntimeError(f"{path} answered success=false: {body}")
     ids = (str(item.get("carid") or "").strip() for item in body.get("data") or [])
     return list(dict.fromkeys(i for i in ids if i))
 
 
-def report_sold(car_ids: List[str], base_url: str) -> Any:
-    resp = requests.post(f"{base_url}/update-car-id", json={"carIds": car_ids},
+def post_car_ids(base_url: str, path: str, car_ids: List[str]) -> Any:
+    resp = requests.post(f"{base_url}/{path}", json={"carIds": car_ids},
                          timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     try:
@@ -123,23 +138,36 @@ class UnknownServer(ValueError):
 
 def sync_sold(server: str = "QA", car_ids: Optional[List[str]] = None,
               dry_run: bool = False, source: str = "manual") -> Dict[str, Any]:
-    """One full run against one server, kept in sync_runs whatever its outcome.
+    """Report the cars that are gone. `car_ids` skips the GET (for testing)."""
+    return _recorded("sync", server, PARTNERS_SERVERS, car_ids, dry_run, source)
 
-    `car_ids` skips the GET (for testing); `dry_run` skips the POST; `source`
-    is what the history shows it was started by. Raises UnknownServer for a
-    server not in PARTNERS_SERVERS (LIVE while it is commented out), and
-    crawl.Locked when another run against the same server holds its lock.
+
+def recheck_sold(server: str = "QA", car_ids: Optional[List[str]] = None,
+                 dry_run: bool = False, source: str = "manual") -> Dict[str, Any]:
+    """Put back the cars reported sold that Encar still advertises."""
+    return _recorded("recheck", server, PARTNERS_RECHECK_SERVERS, car_ids, dry_run, source)
+
+
+def _recorded(kind: str, server: str, enabled, car_ids: Optional[List[str]],
+              dry_run: bool, source: str) -> Dict[str, Any]:
+    """One run against one server, kept in sync_runs whatever its outcome.
+
+    `dry_run` skips the POST; `source` is what the history shows it was
+    started by. Raises UnknownServer for a server not enabled for this kind of
+    run, and crawl.Locked when another run against the same server -- of
+    either kind -- holds its lock.
     """
-    if server not in PARTNERS_SERVERS:
-        raise UnknownServer(f"{server} is not enabled in config.PARTNERS_SERVERS")
+    if server not in PARTNERS_SERVERS or server not in enabled:
+        raise UnknownServer(f"{kind} is not enabled for {server} in encar/config.py")
     base_url = PARTNERS_SERVERS[server]
     started = time.perf_counter()
     with crawl_lock(PARTNERS_LOCK_PATH.format(server=server.lower())):
-        run: Dict[str, Any] = {"started_at": store.now(), "source": source,
+        run: Dict[str, Any] = {"started_at": store.now(), "kind": kind, "source": source,
                                "target": server, "server": urlsplit(base_url).hostname,
                                "dry_run": int(dry_run), "status": "FAILED"}
         try:
-            result = _run(base_url, car_ids, dry_run, run)
+            body = _sync if kind == "sync" else _recheck
+            result = body(base_url, car_ids, dry_run, run)
             run["status"] = "OK"
         except Exception as exc:
             run["note"] = error_note(exc)
@@ -153,19 +181,34 @@ def sync_sold(server: str = "QA", car_ids: Optional[List[str]] = None,
                 finally:
                     conn.close()
             except Exception as exc:  # the history is a record, not the job
-                log(f"[sync-sold] could not save the run: {exc}")
+                log(f"[{kind}-sold] could not save the run: {exc}")
 
     result["elapsed"] = fmt_duration(time.perf_counter() - started)
     return result
 
 
-def _run(base_url: str, car_ids: Optional[List[str]], dry_run: bool,
-         run: Dict[str, Any]) -> Dict[str, Any]:
+def _post(base_url: str, path: str, car_ids: List[str], dry_run: bool,
+          run: Dict[str, Any]) -> Any:
+    """Send the car ids, unless dry_run. Records the answer in `run`."""
+    if not car_ids:
+        return None
+    if dry_run:
+        log(f"[{run['kind']}-sold] dry run: {path} not called")
+        return None
+    response = post_car_ids(base_url, path, car_ids)
+    run.update(reported=1, update_response=response if isinstance(response, str)
+               else json.dumps(response, ensure_ascii=False))
+    log(f"[{run['kind']}-sold] {path} <- {response}")
+    return response
+
+
+def _sync(base_url: str, car_ids: Optional[List[str]], dry_run: bool,
+          run: Dict[str, Any]) -> Dict[str, Any]:
     """The run itself; fills `run` as it goes, so a failure keeps what was known."""
     log(f"sync-sold: {run['started_at']}")
     log(f"Server: {run['server']}")
     if car_ids is None:
-        car_ids = fetch_active_car_ids(base_url)
+        car_ids = fetch_car_ids(base_url, "active-car-id")
     run["checked_ids"] = car_ids
     log(f"Number of active stock check: {len(car_ids)}")
 
@@ -188,15 +231,7 @@ def _run(base_url: str, car_ids: Optional[List[str]], dry_run: bool,
     if sold:
         log(f"listSoldCarId = {sold}")
 
-    response = None
-    if sold and not dry_run:
-        response = report_sold(sold, base_url)
-        run.update(reported=1, update_response=json.dumps(response, ensure_ascii=False)
-                   if not isinstance(response, str) else response)
-        log(f"[sync-sold] update-car-id <- {response}")
-    elif sold:
-        log("[sync-sold] dry run: update-car-id not called")
-
+    response = _post(base_url, "update-car-id", sold, dry_run, run)
     return {
         "server": run["target"],
         "checked": len(car_ids),
@@ -204,6 +239,47 @@ def _run(base_url: str, car_ids: Optional[List[str]], dry_run: bool,
         "errors": {i: states[i]["note"] for i in errors},
         "results": states,
         "reported": bool(sold) and not dry_run,
+        "updateResponse": response,
+        "dryRun": dry_run,
+    }
+
+
+def _recheck(base_url: str, car_ids: Optional[List[str]], dry_run: bool,
+             run: Dict[str, Any]) -> Dict[str, Any]:
+    """The recheck; fills `run` like _sync, with active_ids as the ones put back.
+
+    Only an advertised listing is put back: a 404 stays sold and an error
+    proves nothing either way, so both are left as they are.
+    """
+    log(f"recheck-sold: {run['started_at']}")
+    log(f"Server: {run['server']}")
+    if car_ids is None:
+        car_ids = fetch_car_ids(base_url, "pending-sold-car-id")
+    run["checked_ids"] = car_ids
+    log(f"Number of pending sold check: {len(car_ids)}")
+
+    states = check_car_ids(car_ids) if car_ids else {}
+    active = [i for i in car_ids if states[i]["state"] == ACTIVE]
+    sold = [i for i in car_ids if states[i]["state"] == SOLD]
+    errors = [i for i in car_ids if states[i]["state"] == ERROR]
+    run.update(active_ids=active, sold_ids=sold, error_ids=errors)
+    for i in errors:
+        log(f"    ! {i}: {states[i]['note']}")
+    log(f"After check with encar, still sold: {len(sold)}")
+    if errors:
+        log(f"Could not check (asked again next run): {len(errors)}")
+    log(f"Will be update to active: {len(active)}")
+    if active:
+        log(f"listActiveCarId = {active}")
+
+    response = _post(base_url, "update-active-car-id", active, dry_run, run)
+    return {
+        "server": run["target"],
+        "checked": len(car_ids),
+        "listActiveCarId": active,
+        "errors": {i: states[i]["note"] for i in errors},
+        "results": states,
+        "reported": bool(active) and not dry_run,
         "updateResponse": response,
         "dryRun": dry_run,
     }

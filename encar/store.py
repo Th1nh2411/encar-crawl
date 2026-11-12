@@ -9,8 +9,9 @@ store.py -- The database: one SQLite file, var/encar.db, and everything in it.
     crawl_batches   one row per model per crawl: which route delivered, what it
                     covered, whether sold detection ran and what it marked.
     route_state     which routes are parked after a block, and until when.
-    sync_runs       one row per sync-sold run (partners.py): what partners-stock
-                    listed, what Encar still shows, what was reported sold.
+    sync_runs       one row per sync-sold / recheck-sold run (partners.py): what
+                    partners-stock listed, what Encar still shows, what was
+                    reported sold -- or, for a recheck, put back to active.
     product_group   the sonokong vehicle taxonomy  } imported from data/ by
     rent_product    the sonokong live stock        } stock_import.py
 
@@ -103,14 +104,16 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at      TEXT NOT NULL,
     finished_at     TEXT,
+    kind            TEXT NOT NULL DEFAULT 'sync', -- sync / recheck
     source          TEXT NOT NULL,              -- cron (main.py) / manual (dashboard API)
     target          TEXT,                       -- QA / TEST / LIVE
     server          TEXT,                       -- partners-stock host
     dry_run         INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL CHECK (status IN ('OK', 'FAILED')),
-    checked_ids     TEXT,                       -- JSON: active on partners-stock
-    active_ids      TEXT,                       -- JSON: still advertised on Encar
-    sold_ids        TEXT,                       -- JSON: sent to update-car-id
+    checked_ids     TEXT,                       -- JSON: active (recheck: pending sold) there
+    active_ids      TEXT,                       -- JSON: advertised on Encar (recheck: sent
+                                                --   to update-active-car-id)
+    sold_ids        TEXT,                       -- JSON: gone (sync: sent to update-car-id)
     error_ids       TEXT,                       -- JSON: could not be checked
     reported        INTEGER NOT NULL DEFAULT 0, -- update-car-id was called and answered
     update_response TEXT,
@@ -255,6 +258,9 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE sync_runs ADD COLUMN target TEXT")
         # Every run before servers were named was against QA.
         conn.execute("UPDATE sync_runs SET target = 'QA'")
+        conn.commit()
+    if "kind" not in cols:
+        conn.execute("ALTER TABLE sync_runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'sync'")
         conn.commit()
 
 

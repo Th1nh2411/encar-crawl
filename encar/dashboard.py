@@ -14,9 +14,10 @@ else is a closer look at a row of it:
                       whether sold detection ran -- plus the tail of the log
 
     /check            live "is this plate on sale" lookup
-    /sync             sync-sold history: every cron / manual run, with its car ids
+    /sync             sync-sold / recheck-sold history, with every run's car ids
 
-    POST /api/sync-sold[-test|-live]   one sold sync by hand: QA, TEST, LIVE (partners.py)
+    POST /api/sync-sold[-test|-live]      one sold sync by hand: QA, TEST, LIVE
+    POST /api/recheck-sold[-test|-live]   one recheck by hand (partners.py)
 
 Everything is driven from here -- there is no scheduled crawl:
 
@@ -285,16 +286,25 @@ def runs():
 
 @app.route("/sync")
 def sync_runs():
-    from .config import PARTNERS_SERVERS
+    """The sync-sold history, or with ?kind=recheck the recheck-sold one; ?server= narrows."""
+    from .config import PARTNERS_RECHECK_SERVERS, PARTNERS_SERVERS
 
     page = page_arg()
+    kind = "recheck" if request.args.get("kind") == "recheck" else "sync"
+    server = (request.args.get("server") or "").upper()
+    where, params = ["kind = ?"], [kind]
+    if server:
+        where.append("target = ?")
+        params.append(server)
+    clause = " AND ".join(where)
     conn = db()
     try:
-        total = conn.execute("SELECT COUNT(*) FROM sync_runs").fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) FROM sync_runs WHERE {clause}",
+                             params).fetchone()[0]
         rows = [dict(r) for r in conn.execute(
             "SELECT *, CAST((julianday(finished_at) - julianday(started_at)) * 86400 "
-            "AS INTEGER) AS duration_s FROM sync_runs ORDER BY id DESC "
-            "LIMIT ? OFFSET ?", (PAGE_SIZE, (page - 1) * PAGE_SIZE))]
+            f"AS INTEGER) AS duration_s FROM sync_runs WHERE {clause} ORDER BY id DESC "
+            "LIMIT ? OFFSET ?", (*params, PAGE_SIZE, (page - 1) * PAGE_SIZE))]
     finally:
         conn.close()
     for r in rows:
@@ -306,6 +316,10 @@ def sync_runs():
     return render_template(
         "index.html", view="sync", rows=rows, total=total, page=page,
         pages=max(1, math.ceil(total / PAGE_SIZE)), partner_servers=PARTNERS_SERVERS,
+        kind=kind, server=server,
+        # The servers this kind of run may be started against, for the picker.
+        run_servers=[s for s in PARTNERS_SERVERS
+                     if kind == "sync" or s in PARTNERS_RECHECK_SERVERS],
         status_meta=STATUS, filters={}, **header())
 
 
@@ -437,19 +451,22 @@ def api_check_plate():
     return jsonify({"ok": True, "results": results})
 
 
-@app.post("/api/sync-sold", defaults={"server": "QA"})
-@app.post("/api/sync-sold-test", defaults={"server": "TEST"})
-@app.post("/api/sync-sold-live", defaults={"server": "LIVE"})
-def api_sync_sold(server: str):
-    """One sync-sold run against one server, by hand: what the 2-hour schedule does.
+@app.post("/api/sync-sold", defaults={"server": "QA", "kind": "sync"})
+@app.post("/api/sync-sold-test", defaults={"server": "TEST", "kind": "sync"})
+@app.post("/api/sync-sold-live", defaults={"server": "LIVE", "kind": "sync"})
+@app.post("/api/recheck-sold", defaults={"server": "QA", "kind": "recheck"})
+@app.post("/api/recheck-sold-test", defaults={"server": "TEST", "kind": "recheck"})
+@app.post("/api/recheck-sold-live", defaults={"server": "LIVE", "kind": "recheck"})
+def api_sync_sold(server: str, kind: str):
+    """One sync-sold or recheck-sold run against one server, by hand.
 
-    /api/sync-sold is QA, /api/sync-sold-test TEST, /api/sync-sold-live LIVE
-    (refused for a server commented out in config.PARTNERS_SERVERS).
-    Body: {"dryRun": true} to skip update-car-id; {"carIds": [...]} to check
-    these ids instead of asking partners-stock.
+    No suffix is QA, -test TEST, -live LIVE (refused for a server not enabled
+    for that kind of run in encar/config.py). Body: {"dryRun": true} to skip
+    the POST; {"carIds": [...]} to check these ids instead of asking
+    partners-stock.
     """
     from .crawl import Locked
-    from .partners import UnknownServer, sync_sold
+    from .partners import UnknownServer, recheck_sold, sync_sold
 
     body = json_body()
     if body is None:
@@ -462,12 +479,13 @@ def api_sync_sold(server: str):
             return jsonify({"ok": False,
                             "message": f"At most {CHECK_MAX} car ids at a time"}), 400
     try:
-        result = sync_sold(server, car_ids, dry_run=bool(body.get("dryRun")))
+        job = sync_sold if kind == "sync" else recheck_sold
+        result = job(server, car_ids, dry_run=bool(body.get("dryRun")))
     except UnknownServer as exc:
         return jsonify({"ok": False, "message": str(exc)}), 400
     except Locked:
         return jsonify({"ok": False,
-                        "message": f"A {server} sync-sold run is already going"}), 409
+                        "message": f"A {server} sync or recheck run is already going"}), 409
     except Exception as exc:
         return jsonify({"ok": False, "message": f"{type(exc).__name__}: {exc}"}), 502
     return jsonify({"ok": True, **result})

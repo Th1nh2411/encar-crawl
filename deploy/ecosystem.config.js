@@ -69,5 +69,23 @@ module.exports = {
         PYTHONUNBUFFERED: "1",
       },
     },
+    // 15 minutes after each sync-sold: the car ids reported sold are checked
+    // on Encar again, and the ones still advertised are put back
+    // (update-active-car-id). Only the servers in PARTNERS_RECHECK_SERVERS
+    // (encar/config.py). Same log file as sync-sold.
+    {
+      name: "encar-recheck-sold",
+      cwd: root,
+      script: path.join(root, ".venv", "bin", "python"),
+      args: ["main.py", "recheck-sold"],
+      interpreter: "none",
+      exec_mode: "fork",
+      instances: 1,
+      cron_restart: "15 */2 * * *",
+      autorestart: false,
+      env: {
+        PYTHONUNBUFFERED: "1",
+      },
+    },
   ],
 };

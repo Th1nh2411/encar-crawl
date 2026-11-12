@@ -435,6 +435,31 @@ def test_sync_runs_keep_their_car_ids():
     assert json.loads(row["checked_ids"]) == ["1", "2"]
     assert json.loads(row["sold_ids"]) == ["2"] and row["reported"] == 0
 
+
+def test_recheck_puts_back_only_what_encar_still_advertises():
+    from encar import partners
+
+    states = {"live": "ACTIVE", "gone": "SOLD", "blocked": "ERROR"}
+    sent = []
+    saved = partners.check_car_ids, partners.post_car_ids, partners.log
+    partners.check_car_ids = lambda ids: {i: {"state": states[i], "note": ""} for i in ids}
+    partners.post_car_ids = lambda url, path, ids: sent.append((path, ids)) or {"ok": 1}
+    partners.log = quiet
+    try:
+        run = {"kind": "recheck", "started_at": "t", "server": "h", "target": "QA"}
+        out = partners._recheck("u", ["live", "gone", "blocked"], False, run)
+        assert out["listActiveCarId"] == ["live"]
+        assert sent == [("update-active-car-id", ["live"])]
+        assert run["sold_ids"] == ["gone"] and run["error_ids"] == ["blocked"]
+        assert run["reported"] == 1
+
+        sent.clear()
+        partners._recheck("u", ["live"], True, {"kind": "recheck", "started_at": "t",
+                                                 "server": "h", "target": "QA"})
+        assert sent == []  # a dry run posts nothing
+    finally:
+        partners.check_car_ids, partners.post_car_ids, partners.log = saved
+
 def main_() -> int:
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

@@ -429,25 +429,52 @@
     <span class="ids{{ ' zero' if not n }}" data-ids='{{ (list or [])|tojson }}' data-label="{{ label }}"
       tabindex="0">{{ n if list is not none else '—' }}</span>
   {% endmacro %}
+  {% set recheck = kind == 'recheck' %}
+  {% set post_path = 'update-active-car-id' if recheck else 'update-car-id' %}
   <div class="panel">
-    <div class="panel-hd"><h2>Sold sync</h2>
-      <span class="muted" style="flex: 1 1 360px">Every 2 hours, for each of
-        <b>{{ partner_servers|join(', ') }}</b>: car ids active there, checked on Encar, the sold ones sent
-        to <span class="mono">update-car-id</span>. Hover a number for its car ids.</span>
+    <div class="panel-hd"><h2>{{ 'Re-check' if recheck else 'Sold sync' }}</h2>
+      <span class="muted" style="flex: 1 1 360px">
+      {% if recheck %}
+        15 minutes after each sync, for each of <b>{{ run_servers|join(', ') or 'no server' }}</b>: the car ids
+        reported sold (<span class="mono">pending-sold-car-id</span>) are checked on Encar again; the ones
+        still advertised were not really sold and go back through <span class="mono">update-active-car-id</span>.
+      {% else %}
+        Every 2 hours, for each of <b>{{ run_servers|join(', ') }}</b>: car ids active there, checked on Encar,
+        the sold ones sent to <span class="mono">update-car-id</span>.
+      {% endif %}
+        Hover a number for its car ids.</span>
       <span class="muted" id="syncmsg"></span>
+      {% if run_servers %}
       <select id="syncserver" title="Server to run against">
-        {% for name, url in partner_servers.items() %}<option value="{{ name }}" title="{{ url }}">{{ name }}</option>{% endfor %}
+        {% for name in run_servers %}<option value="{{ name }}" title="{{ partner_servers[name] }}"{{ ' selected' if name == server }}>{{ name }}</option>{% endfor %}
       </select>
-      <button class="btn" id="syncdry" title="Check and record, but do not call update-car-id">Dry run</button>
+      <button class="btn" id="syncdry" data-kind="{{ kind }}" title="Check and record, but do not call {{ post_path }}">Dry run</button>
       <button class="btn primary" id="syncrun">Run now</button>
+      {% endif %}
     </div>
+    <form class="filters" onsubmit="return false">
+      <span class="seg">
+        <a href="{{ url_with(kind=None) }}" class="{{ 'on' if not recheck }}">Sold sync</a>
+        <a href="{{ url_with(kind='recheck') }}" class="{{ 'on' if recheck }}">Re-check</a>
+      </span>
+      <span class="seg">
+        <a href="{{ url_with(server=None) }}" class="{{ 'on' if not server }}">All servers</a>
+        {% for name in partner_servers %}<a href="{{ url_with(server=name) }}" class="{{ 'on' if server == name }}">{{ name }}</a>{% endfor %}
+      </span>
+      <span class="muted" style="align-self: center">{{ total }} run(s)</span>
+    </form>
     <div class="scroll">
-    {% if not rows %}<div class="empty">No sync run yet.</div>{% else %}
+    {% if not rows %}<div class="empty">No {{ 'recheck' if recheck else 'sync' }} run yet.</div>{% else %}
       <table>
         <thead><tr><th>#</th><th>Ran at</th><th>Server</th><th>Source</th><th>Result</th>
+          {% if recheck %}
+          <th class="num">Pending sold on server</th><th class="num">Active again → put back</th>
+          <th class="num">Still sold</th>
+          {% else %}
           <th class="num">Active on server</th><th class="num">Active on Encar</th>
-          <th class="num">Sold → update</th><th class="num">Not checked</th>
-          <th class="num">Took</th><th>Note</th></tr></thead>
+          <th class="num">Sold → update</th>
+          {% endif %}
+          <th class="num">Not checked</th><th class="num">Took</th><th>Note</th></tr></thead>
         <tbody>
         {% for r in rows %}
           <tr>
@@ -456,14 +483,23 @@
             <td title="{{ r.server or '' }}">{% if r.target %}<span class="pill t-{{ {'QA': 'plain', 'TEST': 'warn', 'LIVE': 'ok'}.get(r.target, 'plain') }}">{{ r.target }}</span>{% else %}<span class="faint">—</span>{% endif %}</td>
             <td>{{ r.source }}{% if r.dry_run %} <span class="tag">dry run</span>{% endif %}</td>
             <td><span class="pill t-{{ 'ok' if r.status == 'OK' else 'sold' }}">{{ r.status }}</span></td>
-            <td class="num">{{ ids(r.checked_ids, 'Active on ' ~ (r.server or 'qa-mng')) }}</td>
+            {% set sent = r.active_ids if recheck else r.sold_ids %}
+            {% set sent_tag %}{% if sent %}{% if r.reported %}<span class="tag stock">updated</span>
+              {% elif not r.dry_run %}<span class="tag">not sent</span>{% endif %}{% endif %}{% endset %}
+            {% if recheck %}
+            <td class="num">{{ ids(r.checked_ids, 'Pending sold on ' ~ (r.server or r.target)) }}</td>
+            <td class="num">{{ ids(r.active_ids, 'Advertised on Encar again' ~ (' — sent to ' ~ post_path if r.reported else ' — not sent')) }}
+              {{ sent_tag }}</td>
+            <td class="num">{{ ids(r.sold_ids, 'Still gone on Encar') }}</td>
+            {% else %}
+            <td class="num">{{ ids(r.checked_ids, 'Active on ' ~ (r.server or r.target)) }}</td>
             <td class="num">{{ ids(r.active_ids, 'Still advertised on Encar') }}</td>
-            <td class="num">{{ ids(r.sold_ids, 'Sold' ~ (' — sent to update-car-id' if r.reported else ' — not sent')) }}
-              {% if r.sold_ids %}{% if r.reported %}<span class="tag stock">updated</span>
-              {% elif not r.dry_run %}<span class="tag">not sent</span>{% endif %}{% endif %}</td>
+            <td class="num">{{ ids(r.sold_ids, 'Sold' ~ (' — sent to ' ~ post_path if r.reported else ' — not sent')) }}
+              {{ sent_tag }}</td>
+            {% endif %}
             <td class="num">{{ ids(r.error_ids, 'Not checked — asked again next run') }}</td>
             <td class="num">{{ r.duration_s|dur }}</td>
-            <td class="muted mono" style="white-space: normal; max-width: 280px; word-break: break-word">{{ r.note or r.update_response or '' }}</td>
+            <td class="muted mono" style="white-space: normal; min-width: 220px; max-width: 300px; word-break: break-word">{{ r.note or r.update_response or '' }}</td>
           </tr>
         {% endfor %}
         </tbody>
@@ -683,17 +719,24 @@ if (idpop) {
   const syncmsg = document.getElementById('syncmsg');
   const runSync = async (dryRun) => {
     const server = document.getElementById('syncserver').value;
-    if (!dryRun && !confirm('Check every ' + server + ' car and send the sold ones to update-car-id on ' + server + '?')) return;
+    const recheck = document.getElementById('syncdry').dataset.kind === 'recheck';
+    const ask = recheck
+      ? 'Recheck every pending-sold ' + server + ' car and send the live ones to update-active-car-id on ' + server + '?'
+      : 'Check every ' + server + ' car and send the sold ones to update-car-id on ' + server + '?';
+    if (!dryRun && !confirm(ask)) return;
     const btns = [document.getElementById('syncdry'), document.getElementById('syncrun')];
     btns.forEach(b => b.disabled = true);
     syncmsg.textContent = 'Running…';
-    const data = await post({QA: '/api/sync-sold', TEST: '/api/sync-sold-test', LIVE: '/api/sync-sold-live'}[server], {dryRun});
+    const path = (recheck ? '/api/recheck-sold' : '/api/sync-sold') + {QA: '', TEST: '-test', LIVE: '-live'}[server];
+    const data = await post(path, {dryRun});
     btns.forEach(b => b.disabled = false);
     if (!data.ok) { syncmsg.textContent = data.message; return; }
     location.reload();
   };
-  document.getElementById('syncdry').addEventListener('click', () => runSync(true));
-  document.getElementById('syncrun').addEventListener('click', () => runSync(false));
+  if (document.getElementById('syncdry')) {
+    document.getElementById('syncdry').addEventListener('click', () => runSync(true));
+    document.getElementById('syncrun').addEventListener('click', () => runSync(false));
+  }
 }
 
 poll();
