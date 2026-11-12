@@ -63,7 +63,7 @@ PARTNERS_RECHECK_SERVERS = [
     "TEST",
     # LIVE is off until the customer's server has the recheck endpoints. To
     # turn it on, uncomment this line and restart (pm2 restart encar-dashboard).
-    # "LIVE",
+    "LIVE",
 ]
 PARTNERS_LOCK_PATH = os.path.join(VAR_DIR, "sync-sold-{server}.lock")
 PARTNERS_LOG_PATH = _path("PARTNERS_LOG_FILE", os.path.join("logs", "sync-sold.log"))
